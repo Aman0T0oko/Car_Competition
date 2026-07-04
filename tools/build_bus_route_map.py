@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import heapq
 import json
 import math
 import os
@@ -26,11 +27,14 @@ CHARGE_FIELD = "充电状态"
 SOC_FIELD = "SOC"
 MILEAGE_FIELD = "累计里程 km"
 
-ROUTE_SNAP_METERS = 95
+ROUTE_SNAP_METERS = 60
 CHARGE_CLUSTER_METERS = 160
 GRID_SIZE_METERS = 120
 ROAD_GRID_METERS = 110
-ROAD_MATCH_MAX_METERS = 85
+ROAD_MATCH_MAX_METERS = 35
+ROAD_CONNECT_MAX_AERIAL_METERS = 450
+ROAD_CONNECT_MAX_PATH_METERS = 1200
+ROAD_CONNECT_MAX_SEARCH_NODES = 3500
 WAY_GAP_FILL_MAX_SEGMENTS = 80
 WAY_GAP_FILL_MAX_METERS = 2500
 LOW_CONFIDENCE_MIN_POINTS = 3
@@ -40,10 +44,10 @@ STOP_SPEED_KMH = 1.0
 STOP_MIN_SECONDS = 20
 STOP_MAX_SECONDS = 15 * 60
 STOP_CLUSTER_METERS = 80
-STOP_TO_BUS_STOP_METERS = 95
+STOP_TO_BUS_STOP_METERS = 55
 CONFIRMED_STOP_MIN_EVENTS = 3
 CONFIRMED_STOP_MIN_DAYS = 2
-TRAFFIC_SIGNAL_FILTER_METERS = 50
+TRAFFIC_SIGNAL_FILTER_METERS = 35
 
 
 def parse_float(value, default=None):
@@ -81,6 +85,10 @@ def project(lon, lat, ref_lat):
         lon * 111320 * math.cos(math.radians(ref_lat)),
         lat * 110540,
     )
+
+
+def road_node_key(lat, lon):
+    return f"{lat:.7f},{lon:.7f}"
 
 
 def point_segment_distance_xy(px, py, segment):
@@ -312,6 +320,8 @@ def load_osm_roads(path, ref_lat):
                 continue
             x1, y1 = project(lon1, lat1, ref_lat)
             x2, y2 = project(lon2, lat2, ref_lat)
+            start_node = road_node_key(round(lat1, 7), round(lon1, 7))
+            end_node = road_node_key(round(lat2, 7), round(lon2, 7))
             segments.append({
                 "id": f"{way_id}:{index}",
                 "way_id": way_id,
@@ -319,6 +329,8 @@ def load_osm_roads(path, ref_lat):
                 "name": name,
                 "highway": highway,
                 "path": [[round(lat1, 7), round(lon1, 7)], [round(lat2, 7), round(lon2, 7)]],
+                "start_node": start_node,
+                "end_node": end_node,
                 "x1": x1,
                 "y1": y1,
                 "x2": x2,
@@ -352,6 +364,17 @@ def build_way_segment_index(segments):
     return way_segments
 
 
+def build_road_graph(segments):
+    graph = {}
+    for segment in segments:
+        a = segment["start_node"]
+        b = segment["end_node"]
+        length = segment["length_m"]
+        graph.setdefault(a, []).append((b, length, segment["id"]))
+        graph.setdefault(b, []).append((a, length, segment["id"]))
+    return graph
+
+
 def nearest_road_segment(point, road_grid, ref_lat, max_m):
     px, py = project(point[1], point[0], ref_lat)
     ix = int(px // ROAD_GRID_METERS)
@@ -371,6 +394,58 @@ def nearest_road_segment(point, road_grid, ref_lat, max_m):
     if best[1] is None or best[0] > max_m:
         return None, None
     return best[1], best[0]
+
+
+def segment_endpoint_distance_m(left, right):
+    pairs = [
+        (left["path"][0], right["path"][0]),
+        (left["path"][0], right["path"][1]),
+        (left["path"][1], right["path"][0]),
+        (left["path"][1], right["path"][1]),
+    ]
+    return min(haversine_m(a, b) for a, b in pairs)
+
+
+def shortest_path_between_segments(start_segment, end_segment, graph):
+    if start_segment["id"] == end_segment["id"]:
+        return []
+    start_nodes = [start_segment["start_node"], start_segment["end_node"]]
+    end_nodes = {end_segment["start_node"], end_segment["end_node"]}
+    queue = []
+    best = {}
+    previous = {}
+    for node in start_nodes:
+        best[node] = 0
+        heapq.heappush(queue, (0, node))
+    visited = 0
+    found = None
+    while queue and visited < ROAD_CONNECT_MAX_SEARCH_NODES:
+        dist, node = heapq.heappop(queue)
+        if dist != best.get(node):
+            continue
+        visited += 1
+        if dist > ROAD_CONNECT_MAX_PATH_METERS:
+            break
+        if node in end_nodes:
+            found = node
+            break
+        for next_node, edge_length, segment_id in graph.get(node, []):
+            next_dist = dist + edge_length
+            if next_dist > ROAD_CONNECT_MAX_PATH_METERS:
+                continue
+            if next_dist < best.get(next_node, float("inf")):
+                best[next_node] = next_dist
+                previous[next_node] = (node, segment_id)
+                heapq.heappush(queue, (next_dist, next_node))
+    if found is None:
+        return None
+    segment_ids = []
+    node = found
+    while node in previous:
+        node, segment_id = previous[node]
+        segment_ids.append(segment_id)
+    segment_ids.reverse()
+    return segment_ids
 
 
 def finish_low_confidence_run(runs, current):
@@ -406,6 +481,8 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
     unmatched_points = 0
     unmatched_records = 0
     max_distance = 0
+    route_steps = []
+    last_segment_id = None
 
     progress_step = 200_000
     for index, point in enumerate(points, start=1):
@@ -418,6 +495,12 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             matched_points += 1
             matched_records += point["count"]
             max_distance = max(max_distance, dist)
+            if segment["id"] != last_segment_id:
+                route_steps.append({
+                    "segment_id": segment["id"],
+                    "time": point["start_time"],
+                })
+                last_segment_id = segment["id"]
             stats = matched_by_segment.setdefault(segment["id"], {
                 "count": 0,
                 "raw_records": 0,
@@ -454,6 +537,7 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
     return {
         "file": file_name,
         "matched_by_segment": matched_by_segment,
+        "route_steps": route_steps,
         "low_confidence_segments": low_runs,
         "summary": {
             "matched_points": matched_points,
@@ -462,6 +546,7 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             "unmatched_raw_records": unmatched_records,
             "match_rate": round(match_rate, 4),
             "matched_segments": len(matched_by_segment),
+            "route_steps": len(route_steps),
             "low_confidence_segments": len(low_runs),
             "max_local_distance_m": round(max_distance, 1),
         },
@@ -515,6 +600,76 @@ def fill_same_way_continuity(matches_by_file, way_segments):
         fill_summary[file_name] = filled
         print(f"Continuity fill {file_name}: {filled:,} road segments", flush=True)
     return fill_summary
+
+
+def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
+    connect_summary = {}
+    path_cache = {}
+    for file_name, match in matches_by_file.items():
+        matched_by_segment = match["matched_by_segment"]
+        route_steps = match.get("route_steps", [])
+        added = 0
+        attempted = 0
+        skipped_far = 0
+        failed = 0
+        for left_step, right_step in zip(route_steps, route_steps[1:]):
+            left_id = left_step["segment_id"]
+            right_id = right_step["segment_id"]
+            if left_id == right_id:
+                continue
+            left = segments_by_id.get(left_id)
+            right = segments_by_id.get(right_id)
+            if not left or not right:
+                continue
+            if left["way_id"] == right["way_id"]:
+                continue
+            aerial = segment_endpoint_distance_m(left, right)
+            if aerial > ROAD_CONNECT_MAX_AERIAL_METERS:
+                skipped_far += 1
+                continue
+            attempted += 1
+            key = (left_id, right_id)
+            if key not in path_cache:
+                path_cache[key] = shortest_path_between_segments(left, right, road_graph)
+            path_ids = path_cache[key]
+            if not path_ids:
+                failed += 1
+                continue
+            for segment_id in path_ids:
+                if segment_id in {left_id, right_id}:
+                    continue
+                segment = segments_by_id.get(segment_id)
+                if not segment:
+                    continue
+                is_new = segment_id not in matched_by_segment
+                stats = matched_by_segment.setdefault(segment_id, {
+                    "count": 0,
+                    "raw_records": 0,
+                    "first_time": left_step["time"],
+                    "last_time": right_step["time"],
+                    "max_distance_m": 0,
+                    "graph_connect": True,
+                })
+                if is_new:
+                    added += 1
+                stats["graph_connect"] = True
+        match["summary"]["graph_connect_segments"] = added
+        match["summary"]["graph_connect_attempts"] = attempted
+        match["summary"]["graph_connect_failed"] = failed
+        match["summary"]["graph_connect_skipped_far"] = skipped_far
+        match["summary"]["drawn_segments"] = len(matched_by_segment)
+        connect_summary[file_name] = {
+            "added_segments": added,
+            "attempts": attempted,
+            "failed": failed,
+            "skipped_far": skipped_far,
+        }
+        print(
+            f"Graph connect {file_name}: {added:,} road segments, "
+            f"{attempted:,} attempts, {failed:,} failed, {skipped_far:,} skipped far",
+            flush=True,
+        )
+    return connect_summary
 
 
 def build_route_vertex_index_from_segments(segment_ids, segments_by_id, ref_lat):
@@ -749,6 +904,7 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
         files = []
         counts = {}
         fill_files = []
+        graph_files = []
         max_distance = 0
         for file_name, match in matches_by_file.items():
             stats = match["matched_by_segment"].get(segment_id)
@@ -758,6 +914,8 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
             counts[file_name] = stats["raw_records"]
             if stats.get("continuity_fill"):
                 fill_files.append(file_name)
+            if stats.get("graph_connect"):
+                graph_files.append(file_name)
             max_distance = max(max_distance, stats["max_distance_m"])
         if not files:
             continue
@@ -771,6 +929,7 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
             "match_counts_by_file": dict(sorted(counts.items())),
             "source": "local_osm",
             "continuity_fill_files": sorted(fill_files),
+            "graph_connect_files": sorted(graph_files),
             "max_distance_m": round(max_distance, 1),
         })
     records.extend(osrm_segments)
@@ -1078,7 +1237,7 @@ def build_html(data_json_name):
           .join("<br>");
         L.popup()
           .setLatLng(event.latlng)
-          .setContent(`<strong>道路化轨迹</strong><br>道路名：${{escapeHtml(segment.name || "未命名道路")}}<br>道路等级：${{escapeHtml(segment.highway || "未知")}}<br>来源：${{segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 匹配"}}${{(segment.continuity_fill_files || []).some(file => best.files.includes(file)) ? "，连续路段补齐" : ""}}<br>关联 CSV：${{formatFiles(best.files)}}<br>匹配记录：<br>${{counts || "连续补齐路段"}}`)
+          .setContent(`<strong>道路化轨迹</strong><br>道路名：${{escapeHtml(segment.name || "未命名道路")}}<br>道路等级：${{escapeHtml(segment.highway || "未知")}}<br>来源：${{segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 精确匹配"}}${{(segment.graph_connect_files || []).some(file => best.files.includes(file)) ? "，路网连接" : ""}}${{(segment.continuity_fill_files || []).some(file => best.files.includes(file)) ? "，同路段补齐" : ""}}<br>关联 CSV：${{formatFiles(best.files)}}<br>匹配记录：<br>${{counts || "连接补齐路段"}}`)
           .openOn(this.map);
       }}
     }});
@@ -1225,7 +1384,7 @@ def build_html(data_json_name):
 
         const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
         const matchRows = data.routes.map(route =>
-          `<div><code>${{escapeHtml(route.file)}}</code> 本地 ${{formatPercent(route.road_match.match_rate)}} / 精修后 ${{formatPercent(route.road_match.refined_match_rate)}}，补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+          `<div><code>${{escapeHtml(route.file)}}</code> 精确匹配 ${{formatPercent(route.road_match.match_rate)}}，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
         ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
@@ -1235,7 +1394,7 @@ def build_html(data_json_name):
         `;
         document.getElementById("legend").innerHTML = `
           <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
-          <div>主轨迹已道路化：本地 OSM 匹配为主，并补齐同一 OSM 道路内的短缺口；原始 GPS 折线不在主视图绘制。</div>
+          <div>主轨迹已道路化：35m 精确吸附为主，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
           <div class="match-list">${{matchRows}}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
           <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
@@ -1295,6 +1454,7 @@ def main():
     road_segments = load_osm_roads(OSM_ROADS_FILE, ref_lat)
     segments_by_id = {segment["id"]: segment for segment in road_segments}
     way_segments = build_way_segment_index(road_segments)
+    road_graph = build_road_graph(road_segments)
     road_grid = build_road_segment_index(road_segments)
     matches_by_file = {}
     route_grids_by_file = {}
@@ -1328,9 +1488,14 @@ def main():
         })
 
     continuity_fill_by_file = fill_same_way_continuity(matches_by_file, way_segments)
+    graph_connect_by_file = connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph)
     for route in routes:
         summary = matches_by_file[route["file"]]["summary"]
         route["road_match"]["continuity_fill_segments"] = summary["continuity_fill_segments"]
+        route["road_match"]["graph_connect_segments"] = summary["graph_connect_segments"]
+        route["road_match"]["graph_connect_attempts"] = summary["graph_connect_attempts"]
+        route["road_match"]["graph_connect_failed"] = summary["graph_connect_failed"]
+        route["road_match"]["graph_connect_skipped_far"] = summary["graph_connect_skipped_far"]
         route["road_match"]["drawn_segments"] = summary["drawn_segments"]
     route_grids_by_file = {
         file_name: build_route_vertex_index_from_segments(match["matched_by_segment"], segments_by_id, ref_lat)
@@ -1375,8 +1540,11 @@ def main():
             "stop_events": len(stop_events),
             "stop_evidence": stop_evidence,
             "continuity_fill_by_file": continuity_fill_by_file,
+            "graph_connect_by_file": graph_connect_by_file,
             "way_gap_fill_max_segments": WAY_GAP_FILL_MAX_SEGMENTS,
             "way_gap_fill_max_meters": WAY_GAP_FILL_MAX_METERS,
+            "road_connect_max_aerial_meters": ROAD_CONNECT_MAX_AERIAL_METERS,
+            "road_connect_max_path_meters": ROAD_CONNECT_MAX_PATH_METERS,
             "osrm_summary_by_file": osrm_summary_by_file,
             "compression": "Only consecutive identical latitude/longitude records are merged. The main map draws matched road geometry instead of raw GPS polylines.",
         },

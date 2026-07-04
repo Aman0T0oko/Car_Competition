@@ -297,7 +297,7 @@
           .join("<br>");
         L.popup()
           .setLatLng(event.latlng)
-          .setContent(`<strong>道路化轨迹</strong><br>道路名：${escapeHtml(segment.name || "未命名道路")}<br>道路等级：${escapeHtml(segment.highway || "未知")}<br>来源：${segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 匹配"}${(segment.continuity_fill_files || []).some(file => best.files.includes(file)) ? "，连续路段补齐" : ""}<br>关联 CSV：${formatFiles(best.files)}<br>匹配记录：<br>${counts || "连续补齐路段"}`)
+          .setContent(`<strong>道路化轨迹</strong><br>道路名：${escapeHtml(segment.name || "未命名道路")}<br>道路等级：${escapeHtml(segment.highway || "未知")}<br>来源：${segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 精确匹配"}${(segment.graph_connect_files || []).some(file => best.files.includes(file)) ? "，路网连接" : ""}${(segment.continuity_fill_files || []).some(file => best.files.includes(file)) ? "，同路段补齐" : ""}<br>关联 CSV：${formatFiles(best.files)}<br>匹配记录：<br>${counts || "连接补齐路段"}`)
           .openOn(this.map);
       }
     });
@@ -444,7 +444,7 @@
 
         const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
         const matchRows = data.routes.map(route =>
-          `<div><code>${escapeHtml(route.file)}</code> 本地 ${formatPercent(route.road_match.match_rate)} / 精修后 ${formatPercent(route.road_match.refined_match_rate)}，补齐 ${route.road_match.continuity_fill_segments || 0} 段，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
+          `<div><code>${escapeHtml(route.file)}</code> 精确匹配 ${formatPercent(route.road_match.match_rate)}，同路补齐 ${route.road_match.continuity_fill_segments || 0} 段，路网连接 ${route.road_match.graph_connect_segments || 0} 段，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
         ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${data.routes.length}</strong>CSV 轨迹</div>
@@ -454,7 +454,7 @@
         `;
         document.getElementById("legend").innerHTML = `
           <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
-          <div>主轨迹已道路化：本地 OSM 匹配为主，并补齐同一 OSM 道路内的短缺口；原始 GPS 折线不在主视图绘制。</div>
+          <div>主轨迹已道路化：35m 精确吸附为主，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
           <div class="match-list">${matchRows}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
           <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
