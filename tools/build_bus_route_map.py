@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 
 
@@ -23,6 +24,11 @@ MILEAGE_FIELD = "累计里程 km"
 ROUTE_SNAP_METERS = 95
 CHARGE_CLUSTER_METERS = 160
 GRID_SIZE_METERS = 120
+STOP_SPEED_KMH = 1.0
+STOP_MIN_SECONDS = 20
+STOP_MAX_SECONDS = 15 * 60
+STOP_CLUSTER_METERS = 80
+STOP_TO_BUS_STOP_METERS = 95
 
 
 def parse_float(value, default=None):
@@ -30,6 +36,16 @@ def parse_float(value, default=None):
         return float(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def parse_time(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
 
 def valid_coord(lon, lat):
@@ -172,6 +188,86 @@ def nearest_route_vertex_m(point, grid, ref_lat):
     return best
 
 
+def build_poi_index(items, ref_lat, cell_m):
+    grid = {}
+    for item in items:
+        x, y = project(item["lon"], item["lat"], ref_lat)
+        key = (int(x // cell_m), int(y // cell_m))
+        grid.setdefault(key, []).append((x, y, item))
+    return grid
+
+
+def nearest_indexed_item(point, grid, ref_lat, cell_m, max_m):
+    x, y = project(point[1], point[0], ref_lat)
+    ix = int(x // cell_m)
+    iy = int(y // cell_m)
+    best = (float("inf"), None)
+    cells = int(math.ceil(max_m / cell_m)) + 1
+    for dx in range(-cells, cells + 1):
+        for dy in range(-cells, cells + 1):
+            for item_x, item_y, item in grid.get((ix + dx, iy + dy), []):
+                dist = math.hypot(x - item_x, y - item_y)
+                if dist < best[0]:
+                    best = (dist, item)
+    if best[1] is None or best[0] > max_m:
+        return None, None
+    return best[1], best[0]
+
+
+def extract_stop_events(rows, file_name):
+    events = []
+    current = None
+
+    def finish():
+        nonlocal current
+        if not current:
+            return
+        start_dt = current["start_dt"]
+        end_dt = current["end_dt"]
+        duration = int((end_dt - start_dt).total_seconds()) if start_dt and end_dt else 0
+        if STOP_MIN_SECONDS <= duration <= STOP_MAX_SECONDS and current["count"] >= 2:
+            events.append({
+                "file": file_name,
+                "lat": round(current["lat_sum"] / current["count"], 6),
+                "lon": round(current["lon_sum"] / current["count"], 6),
+                "start_time": current["start_time"],
+                "end_time": current["end_time"],
+                "duration_s": duration,
+                "count": current["count"],
+            })
+        current = None
+
+    for row in rows:
+        timestamp = parse_time(row["time"])
+        is_stopped = row["speed"] is not None and row["speed"] <= STOP_SPEED_KMH and row["charge"] not in {"1", "4"}
+        if not is_stopped or timestamp is None:
+            finish()
+            continue
+        if current:
+            gap_s = (timestamp - current["end_dt"]).total_seconds()
+            center = (current["lat_sum"] / current["count"], current["lon_sum"] / current["count"])
+            if gap_s > 90 or haversine_m((row["lat"], row["lon"]), center) > STOP_CLUSTER_METERS:
+                finish()
+        if not current:
+            current = {
+                "start_dt": timestamp,
+                "end_dt": timestamp,
+                "start_time": row["time"],
+                "end_time": row["time"],
+                "lat_sum": row["lat"],
+                "lon_sum": row["lon"],
+                "count": 1,
+            }
+        else:
+            current["end_dt"] = timestamp
+            current["end_time"] = row["time"]
+            current["lat_sum"] += row["lat"]
+            current["lon_sum"] += row["lon"]
+            current["count"] += 1
+    finish()
+    return events
+
+
 def cluster_points(points, radius_m, label_prefix):
     clusters = []
     for point in points:
@@ -239,7 +335,7 @@ def load_osm_poi(path):
     return pois
 
 
-def filter_pois_near_route(pois, route_grid, ref_lat):
+def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
     selected = []
     seen = set()
     for poi in pois:
@@ -247,14 +343,64 @@ def filter_pois_near_route(pois, route_grid, ref_lat):
         if key in seen:
             continue
         point = (poi["lat"], poi["lon"])
-        dist = nearest_route_vertex_m(point, route_grid, ref_lat)
-        if dist <= ROUTE_SNAP_METERS:
+        files = []
+        distances = {}
+        for file_name, route_grid in route_grids_by_file.items():
+            dist = nearest_route_vertex_m(point, route_grid, ref_lat)
+            if dist <= ROUTE_SNAP_METERS:
+                files.append(file_name)
+                distances[file_name] = round(dist, 1)
+        if files:
             poi = dict(poi)
-            poi["distance_m"] = round(dist, 1)
+            poi["files"] = sorted(files)
+            poi["route_distances_m"] = dict(sorted(distances.items()))
+            poi["distance_m"] = min(distances.values())
+            poi["stop_files"] = []
+            poi["stop_stats"] = {}
             selected.append(poi)
             seen.add(key)
     selected.sort(key=lambda p: (p["kind"], p.get("name") or "", p["distance_m"]))
     return selected
+
+
+def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat):
+    bus_stop_index = build_poi_index(all_bus_stops, ref_lat, STOP_TO_BUS_STOP_METERS)
+    evidence = {}
+    for event in stop_events:
+        station, dist = nearest_indexed_item(
+            (event["lat"], event["lon"]),
+            bus_stop_index,
+            ref_lat,
+            STOP_TO_BUS_STOP_METERS,
+            STOP_TO_BUS_STOP_METERS,
+        )
+        if not station:
+            continue
+        station_id = station["id"]
+        by_file = evidence.setdefault(station_id, {})
+        stats = by_file.setdefault(event["file"], {
+            "events": 0,
+            "total_dwell_s": 0,
+            "max_dwell_s": 0,
+            "first_time": event["start_time"],
+            "last_time": event["end_time"],
+            "nearest_stop_event_m": round(dist, 1),
+        })
+        stats["events"] += 1
+        stats["total_dwell_s"] += event["duration_s"]
+        stats["max_dwell_s"] = max(stats["max_dwell_s"], event["duration_s"])
+        stats["first_time"] = min(stats["first_time"], event["start_time"])
+        stats["last_time"] = max(stats["last_time"], event["end_time"])
+        stats["nearest_stop_event_m"] = min(stats["nearest_stop_event_m"], round(dist, 1))
+
+    poi_by_id = {poi["id"]: poi for poi in osm_pois if poi["kind"] == "bus_stop"}
+    for station_id, by_file in evidence.items():
+        poi = poi_by_id.get(station_id)
+        if not poi:
+            continue
+        poi["stop_files"] = sorted(by_file)
+        poi["stop_stats"] = dict(sorted(by_file.items()))
+    return evidence
 
 
 def build_html(data_json_name):
@@ -439,6 +585,8 @@ def build_html(data_json_name):
     const stationLayer = L.layerGroup().addTo(map);
     const signalLayer = L.layerGroup().addTo(map);
     const routeEndpointLayers = new Map();
+    const linkedMarkerRecords = [];
+    let activeFiles = new Set();
     const overlays = {{
       "行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
@@ -571,6 +719,38 @@ def build_html(data_json_name):
       }}[ch]));
     }}
 
+    function formatDuration(seconds) {{
+      const total = Number(seconds || 0);
+      const minutes = Math.floor(total / 60);
+      const rest = total % 60;
+      return minutes > 0 ? `${{minutes}}分${{rest}}秒` : `${{rest}}秒`;
+    }}
+
+    function formatFiles(files) {{
+      return (files || []).map(file => `<code>${{escapeHtml(file)}}</code>`).join("、") || "无";
+    }}
+
+    function hasActiveFile(files) {{
+      return (files || []).some(file => activeFiles.has(file));
+    }}
+
+    function addLinkedMarker(group, marker, files) {{
+      const record = {{ group, marker, files: files || [] }};
+      linkedMarkerRecords.push(record);
+      if (hasActiveFile(record.files)) {{
+        marker.addTo(group);
+      }}
+    }}
+
+    function refreshLinkedMarkers() {{
+      linkedMarkerRecords.forEach(record => {{
+        const shouldShow = hasActiveFile(record.files);
+        const isShown = record.group.hasLayer(record.marker);
+        if (shouldShow && !isShown) record.marker.addTo(record.group);
+        if (!shouldShow && isShown) record.group.removeLayer(record.marker);
+      }});
+    }}
+
     function setupUiToggle() {{
       const button = document.getElementById("uiToggle");
       button.addEventListener("click", () => {{
@@ -593,11 +773,14 @@ def build_html(data_json_name):
           const file = event.target.dataset.file;
           const visible = event.target.checked;
           canvasRoutes.setVisible(file, visible);
+          if (visible) activeFiles.add(file);
+          else activeFiles.delete(file);
           const endpointLayer = routeEndpointLayers.get(file);
           if (endpointLayer) {{
             if (visible) endpointLayer.addTo(startEndLayers);
             else startEndLayers.removeLayer(endpointLayer);
           }}
+          refreshLinkedMarkers();
         }});
       }});
     }}
@@ -608,6 +791,7 @@ def build_html(data_json_name):
       .then(response => response.json())
       .then(data => {{
         const bounds = [];
+        activeFiles = new Set(data.routes.map(route => route.file));
         const canvasRoutes = new CanvasRouteLayer(data.routes).addTo(routeLayers);
         data.routes.forEach((route, index) => {{
           const color = colors[index % colors.length];
@@ -625,20 +809,29 @@ def build_html(data_json_name):
         }}
 
         data.charging_locations.forEach(item => {{
-          circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
-            `<strong>${{escapeHtml(item.name)}}</strong><br>记录数：${{item.count.toLocaleString()}}<br>状态：${{escapeHtml(JSON.stringify(item.charge_states))}}<br>${{escapeHtml(item.first_time)}} 至 ${{escapeHtml(item.last_time)}}`,
-            "#fde68a").addTo(chargingLayer);
+          const marker = circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
+            `<strong>充电位置</strong><br>${{escapeHtml(item.name)}}<br>关联 CSV：${{formatFiles(item.files)}}<br>记录数：${{item.count.toLocaleString()}}<br>状态：${{escapeHtml(JSON.stringify(item.charge_states))}}<br>${{escapeHtml(item.first_time)}} 至 ${{escapeHtml(item.last_time)}}`,
+            "#fde68a");
+          addLinkedMarker(chargingLayer, marker, item.files);
         }});
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {{
-          circle(item.lat, item.lon, "#2563eb", 4,
-            `<strong>公交站点</strong><br>${{escapeHtml(item.name || "未命名站点")}}<br>距轨迹约 ${{item.distance_m}} m`,
-            "#93c5fd").addTo(stationLayer);
+          const hasStopEvidence = item.stop_files && item.stop_files.length;
+          const statsHtml = hasStopEvidence
+            ? Object.entries(item.stop_stats).map(([file, stats]) =>
+                `<br><code>${{escapeHtml(file)}}</code>：停靠 ${{stats.events}} 次，累计 ${{formatDuration(stats.total_dwell_s)}}，最长 ${{formatDuration(stats.max_dwell_s)}}`
+              ).join("")
+            : "<br>停靠证据：未检测到达到阈值的停靠";
+          const marker = circle(item.lat, item.lon, hasStopEvidence ? "#1d4ed8" : "#64748b", hasStopEvidence ? 5.6 : 3.6,
+            `<strong>${{hasStopEvidence ? "停靠站点" : "沿线站点"}}</strong><br>${{escapeHtml(item.name || "未命名站点")}}<br>轨迹关联：${{formatFiles(item.files)}}<br>停靠归属：${{formatFiles(item.stop_files)}}${{statsHtml}}`,
+            hasStopEvidence ? "#60a5fa" : "#cbd5e1");
+          addLinkedMarker(stationLayer, marker, item.files);
         }});
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {{
-          circle(item.lat, item.lon, "#dc2626", 3.8,
-            `<strong>红绿灯</strong><br>${{escapeHtml(item.name || "交通信号灯")}}<br>距轨迹约 ${{item.distance_m}} m`,
-            "#fecaca").addTo(signalLayer);
+          const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
+            `<strong>红绿灯</strong><br>${{escapeHtml(item.name || "交通信号灯")}}<br>关联 CSV：${{formatFiles(item.files)}}<br>最近轨迹距离：${{item.distance_m}} m`,
+            "#fecaca");
+          addLinkedMarker(signalLayer, marker, item.files);
         }});
 
         if (bounds.length) {{
@@ -649,13 +842,14 @@ def build_html(data_json_name):
           <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
           <div class="stat"><strong>${{data.summary.total_raw_points.toLocaleString()}}</strong>原始定位点</div>
           <div class="stat"><strong>${{data.charging_locations.length}}</strong>充电位置</div>
-          <div class="stat"><strong>${{data.osm_counts.bus_stop}}</strong>站点 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
+          <div class="stat"><strong>${{data.osm_counts.stop_bus_stop || 0}}</strong>停靠站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
         `;
         document.getElementById("legend").innerHTML = `
           <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
           <div>路径使用全量数据；仅合并连续相同经纬度：${{data.summary.total_compressed_points.toLocaleString()}} 个绘制点，合并 ${{data.summary.total_merged_repeats.toLocaleString()}} 条重复记录</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#2563eb"></span>OSM 公交站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>OSM 红绿灯</div>
+          <div><span class="dot" style="background:#60a5fa"></span>停靠站点 <span class="dot" style="background:#cbd5e1;margin-left:12px"></span>沿线站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+          <div>CSV 勾选会联动隐藏/显示对应轨迹、充电位置、站点、红绿灯。</div>
         `;
       }});
   </script>
@@ -667,8 +861,9 @@ def build_html(data_json_name):
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
     routes = []
-    all_route_points = []
+    route_points_by_file = {}
     charging_points = []
+    stop_events = []
     total_raw_points = 0
     total_compressed_points = 0
     total_merged_repeats = 0
@@ -685,7 +880,8 @@ def main():
         total_raw_points += len(rows)
         total_compressed_points += len(compressed)
         total_merged_repeats += len(rows) - len(compressed)
-        all_route_points.extend((p["lat"], p["lon"]) for p in compressed)
+        route_points_by_file[path.name] = [(p["lat"], p["lon"]) for p in compressed]
+        stop_events.extend(extract_stop_events(rows, path.name))
         for p in rows:
             bbox[0] = min(bbox[0], p["lon"])
             bbox[1] = min(bbox[1], p["lat"])
@@ -704,10 +900,16 @@ def main():
     ref_lat = (bbox[1] + bbox[3]) / 2
     charging_locations = cluster_points(charging_points, CHARGE_CLUSTER_METERS, "充电位置")
     pois = load_osm_poi(OSM_POI_FILE)
-    route_grid = build_route_vertex_index(all_route_points, ref_lat)
-    osm_pois = filter_pois_near_route(pois, route_grid, ref_lat) if pois else []
+    route_grids_by_file = {
+        file_name: build_route_vertex_index(points, ref_lat)
+        for file_name, points in route_points_by_file.items()
+    }
+    osm_pois = annotate_pois_by_routes(pois, route_grids_by_file, ref_lat) if pois else []
+    all_bus_stops = [poi for poi in pois if poi["kind"] == "bus_stop"]
+    stop_evidence = attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat) if pois else {}
     osm_counts = {
         "bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop"),
+        "stop_bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop" and p.get("stop_files")),
         "traffic_signal": sum(1 for p in osm_pois if p["kind"] == "traffic_signal"),
     }
 
@@ -719,6 +921,12 @@ def main():
             "bbox": bbox,
             "poi_source": "OpenStreetMap Overpass API",
             "route_snap_meters": ROUTE_SNAP_METERS,
+            "stop_speed_kmh": STOP_SPEED_KMH,
+            "stop_min_seconds": STOP_MIN_SECONDS,
+            "stop_max_seconds": STOP_MAX_SECONDS,
+            "stop_to_bus_stop_meters": STOP_TO_BUS_STOP_METERS,
+            "stop_events": len(stop_events),
+            "matched_stop_stations": len(stop_evidence),
             "compression": "Only consecutive identical latitude/longitude records are merged. No route sampling is used.",
         },
         "routes": routes,
@@ -735,6 +943,7 @@ def main():
     print(f"Routes: {len(routes)}, raw points: {total_raw_points}")
     print(f"Compressed route points: {total_compressed_points}, merged repeats: {total_merged_repeats}")
     print(f"Charging clusters: {len(charging_locations)}")
+    print(f"Stop events: {len(stop_events)}, matched stop stations: {len(stop_evidence)}")
     print(f"OSM POIs near route: {osm_counts}")
 
 

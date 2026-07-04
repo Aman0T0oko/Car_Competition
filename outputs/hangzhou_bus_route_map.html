@@ -179,6 +179,8 @@
     const stationLayer = L.layerGroup().addTo(map);
     const signalLayer = L.layerGroup().addTo(map);
     const routeEndpointLayers = new Map();
+    const linkedMarkerRecords = [];
+    let activeFiles = new Set();
     const overlays = {
       "行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
@@ -311,6 +313,38 @@
       }[ch]));
     }
 
+    function formatDuration(seconds) {
+      const total = Number(seconds || 0);
+      const minutes = Math.floor(total / 60);
+      const rest = total % 60;
+      return minutes > 0 ? `${minutes}分${rest}秒` : `${rest}秒`;
+    }
+
+    function formatFiles(files) {
+      return (files || []).map(file => `<code>${escapeHtml(file)}</code>`).join("、") || "无";
+    }
+
+    function hasActiveFile(files) {
+      return (files || []).some(file => activeFiles.has(file));
+    }
+
+    function addLinkedMarker(group, marker, files) {
+      const record = { group, marker, files: files || [] };
+      linkedMarkerRecords.push(record);
+      if (hasActiveFile(record.files)) {
+        marker.addTo(group);
+      }
+    }
+
+    function refreshLinkedMarkers() {
+      linkedMarkerRecords.forEach(record => {
+        const shouldShow = hasActiveFile(record.files);
+        const isShown = record.group.hasLayer(record.marker);
+        if (shouldShow && !isShown) record.marker.addTo(record.group);
+        if (!shouldShow && isShown) record.group.removeLayer(record.marker);
+      });
+    }
+
     function setupUiToggle() {
       const button = document.getElementById("uiToggle");
       button.addEventListener("click", () => {
@@ -333,11 +367,14 @@
           const file = event.target.dataset.file;
           const visible = event.target.checked;
           canvasRoutes.setVisible(file, visible);
+          if (visible) activeFiles.add(file);
+          else activeFiles.delete(file);
           const endpointLayer = routeEndpointLayers.get(file);
           if (endpointLayer) {
             if (visible) endpointLayer.addTo(startEndLayers);
             else startEndLayers.removeLayer(endpointLayer);
           }
+          refreshLinkedMarkers();
         });
       });
     }
@@ -348,6 +385,7 @@
       .then(response => response.json())
       .then(data => {
         const bounds = [];
+        activeFiles = new Set(data.routes.map(route => route.file));
         const canvasRoutes = new CanvasRouteLayer(data.routes).addTo(routeLayers);
         data.routes.forEach((route, index) => {
           const color = colors[index % colors.length];
@@ -365,20 +403,29 @@
         }
 
         data.charging_locations.forEach(item => {
-          circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
-            `<strong>${escapeHtml(item.name)}</strong><br>记录数：${item.count.toLocaleString()}<br>状态：${escapeHtml(JSON.stringify(item.charge_states))}<br>${escapeHtml(item.first_time)} 至 ${escapeHtml(item.last_time)}`,
-            "#fde68a").addTo(chargingLayer);
+          const marker = circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
+            `<strong>充电位置</strong><br>${escapeHtml(item.name)}<br>关联 CSV：${formatFiles(item.files)}<br>记录数：${item.count.toLocaleString()}<br>状态：${escapeHtml(JSON.stringify(item.charge_states))}<br>${escapeHtml(item.first_time)} 至 ${escapeHtml(item.last_time)}`,
+            "#fde68a");
+          addLinkedMarker(chargingLayer, marker, item.files);
         });
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {
-          circle(item.lat, item.lon, "#2563eb", 4,
-            `<strong>公交站点</strong><br>${escapeHtml(item.name || "未命名站点")}<br>距轨迹约 ${item.distance_m} m`,
-            "#93c5fd").addTo(stationLayer);
+          const hasStopEvidence = item.stop_files && item.stop_files.length;
+          const statsHtml = hasStopEvidence
+            ? Object.entries(item.stop_stats).map(([file, stats]) =>
+                `<br><code>${escapeHtml(file)}</code>：停靠 ${stats.events} 次，累计 ${formatDuration(stats.total_dwell_s)}，最长 ${formatDuration(stats.max_dwell_s)}`
+              ).join("")
+            : "<br>停靠证据：未检测到达到阈值的停靠";
+          const marker = circle(item.lat, item.lon, hasStopEvidence ? "#1d4ed8" : "#64748b", hasStopEvidence ? 5.6 : 3.6,
+            `<strong>${hasStopEvidence ? "停靠站点" : "沿线站点"}</strong><br>${escapeHtml(item.name || "未命名站点")}<br>轨迹关联：${formatFiles(item.files)}<br>停靠归属：${formatFiles(item.stop_files)}${statsHtml}`,
+            hasStopEvidence ? "#60a5fa" : "#cbd5e1");
+          addLinkedMarker(stationLayer, marker, item.files);
         });
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {
-          circle(item.lat, item.lon, "#dc2626", 3.8,
-            `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>距轨迹约 ${item.distance_m} m`,
-            "#fecaca").addTo(signalLayer);
+          const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
+            `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>关联 CSV：${formatFiles(item.files)}<br>最近轨迹距离：${item.distance_m} m`,
+            "#fecaca");
+          addLinkedMarker(signalLayer, marker, item.files);
         });
 
         if (bounds.length) {
@@ -389,13 +436,14 @@
           <div class="stat"><strong>${data.routes.length}</strong>CSV 轨迹</div>
           <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
           <div class="stat"><strong>${data.charging_locations.length}</strong>充电位置</div>
-          <div class="stat"><strong>${data.osm_counts.bus_stop}</strong>站点 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
+          <div class="stat"><strong>${data.osm_counts.stop_bus_stop || 0}</strong>停靠站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
         `;
         document.getElementById("legend").innerHTML = `
           <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
           <div>路径使用全量数据；仅合并连续相同经纬度：${data.summary.total_compressed_points.toLocaleString()} 个绘制点，合并 ${data.summary.total_merged_repeats.toLocaleString()} 条重复记录</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#2563eb"></span>OSM 公交站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>OSM 红绿灯</div>
+          <div><span class="dot" style="background:#60a5fa"></span>停靠站点 <span class="dot" style="background:#cbd5e1;margin-left:12px"></span>沿线站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+          <div>CSV 勾选会联动隐藏/显示对应轨迹、充电位置、站点、红绿灯。</div>
         `;
       });
   </script>
