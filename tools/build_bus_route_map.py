@@ -2,6 +2,10 @@
 import csv
 import json
 import math
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "浙江杭州"
 OUTPUT_DIR = ROOT / "outputs"
 OSM_POI_FILE = OUTPUT_DIR / "hangzhou_osm_poi.json"
+OSM_ROADS_FILE = OUTPUT_DIR / "hangzhou_osm_roads.json"
 DATA_JSON = OUTPUT_DIR / "bus_route_map_data.json"
 HTML_FILE = OUTPUT_DIR / "hangzhou_bus_route_map.html"
 
@@ -24,11 +29,19 @@ MILEAGE_FIELD = "累计里程 km"
 ROUTE_SNAP_METERS = 95
 CHARGE_CLUSTER_METERS = 160
 GRID_SIZE_METERS = 120
+ROAD_GRID_METERS = 110
+ROAD_MATCH_MAX_METERS = 85
+LOW_CONFIDENCE_MIN_POINTS = 3
+OSRM_MAX_POINTS = 100
+OSRM_MAX_SEGMENTS_PER_ROUTE = 12
 STOP_SPEED_KMH = 1.0
 STOP_MIN_SECONDS = 20
 STOP_MAX_SECONDS = 15 * 60
 STOP_CLUSTER_METERS = 80
 STOP_TO_BUS_STOP_METERS = 95
+CONFIRMED_STOP_MIN_EVENTS = 3
+CONFIRMED_STOP_MIN_DAYS = 2
+TRAFFIC_SIGNAL_FILTER_METERS = 50
 
 
 def parse_float(value, default=None):
@@ -61,18 +74,6 @@ def haversine_m(a, b):
     return 6371000 * 2 * math.asin(math.sqrt(h))
 
 
-def point_segment_distance_m(point, a, b, ref_lat):
-    px, py = project(point[1], point[0], ref_lat)
-    ax, ay = project(a[1], a[0], ref_lat)
-    bx, by = project(b[1], b[0], ref_lat)
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
-    cx, cy = ax + t * dx, ay + t * dy
-    return math.hypot(px - cx, py - cy)
-
-
 def project(lon, lat, ref_lat):
     return (
         lon * 111320 * math.cos(math.radians(ref_lat)),
@@ -80,20 +81,15 @@ def project(lon, lat, ref_lat):
     )
 
 
-def min_distance_to_route(point, route_points, ref_lat):
-    if not route_points:
-        return float("inf")
-    if len(route_points) == 1:
-        return haversine_m(point, route_points[0])
-    best = float("inf")
-    # Route data is already sampled, so checking each segment is acceptable.
-    for i in range(len(route_points) - 1):
-        dist = point_segment_distance_m(point, route_points[i], route_points[i + 1], ref_lat)
-        if dist < best:
-            best = dist
-            if best <= ROUTE_SNAP_METERS:
-                return best
-    return best
+def point_segment_distance_xy(px, py, segment):
+    ax, ay = segment["x1"], segment["y1"]
+    bx, by = segment["x2"], segment["y2"]
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    cx, cy = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx, py - cy)
 
 
 def read_csv_points(path):
@@ -138,54 +134,6 @@ def compress_consecutive_points(rows):
             "end_time": point["time"],
         })
     return compressed
-
-
-def encode_polyline6(points):
-    result = []
-    last_lat = 0
-    last_lon = 0
-    for point in points:
-        lat = int(round(point["lat"] * 1_000_000))
-        lon = int(round(point["lon"] * 1_000_000))
-        result.append(encode_signed(lat - last_lat))
-        result.append(encode_signed(lon - last_lon))
-        last_lat = lat
-        last_lon = lon
-    return "".join(result)
-
-
-def encode_signed(value):
-    value = ~(value << 1) if value < 0 else value << 1
-    chunks = []
-    while value >= 0x20:
-        chunks.append(chr((0x20 | (value & 0x1f)) + 63))
-        value >>= 5
-    chunks.append(chr(value + 63))
-    return "".join(chunks)
-
-
-def build_route_vertex_index(route_points, ref_lat):
-    grid = {}
-    for lat, lon in route_points:
-        x, y = project(lon, lat, ref_lat)
-        key = (int(x // GRID_SIZE_METERS), int(y // GRID_SIZE_METERS))
-        grid.setdefault(key, []).append((x, y))
-    return grid
-
-
-def nearest_route_vertex_m(point, grid, ref_lat):
-    x, y = project(point[1], point[0], ref_lat)
-    ix = int(x // GRID_SIZE_METERS)
-    iy = int(y // GRID_SIZE_METERS)
-    best = float("inf")
-    cells = int(math.ceil(ROUTE_SNAP_METERS / GRID_SIZE_METERS)) + 1
-    for dx in range(-cells, cells + 1):
-        for dy in range(-cells, cells + 1):
-            for rx, ry in grid.get((ix + dx, iy + dy), []):
-                dist = math.hypot(x - rx, y - ry)
-                if dist < best:
-                    best = dist
-    return best
 
 
 def build_poi_index(items, ref_lat, cell_m):
@@ -335,6 +283,216 @@ def load_osm_poi(path):
     return pois
 
 
+def load_osm_roads(path, ref_lat):
+    if not path.exists():
+        raise FileNotFoundError(f"Missing OSM road data: {path}")
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    segments = []
+    for element in data.get("elements", []):
+        if element.get("type") != "way":
+            continue
+        geometry = element.get("geometry") or []
+        if len(geometry) < 2:
+            continue
+        tags = element.get("tags", {})
+        highway = tags.get("highway", "")
+        name = tags.get("name") or tags.get("ref") or ""
+        way_id = element.get("id")
+        for index in range(len(geometry) - 1):
+            a = geometry[index]
+            b = geometry[index + 1]
+            lat1, lon1 = a.get("lat"), a.get("lon")
+            lat2, lon2 = b.get("lat"), b.get("lon")
+            if not valid_coord(lon1, lat1) or not valid_coord(lon2, lat2):
+                continue
+            if lat1 == lat2 and lon1 == lon2:
+                continue
+            x1, y1 = project(lon1, lat1, ref_lat)
+            x2, y2 = project(lon2, lat2, ref_lat)
+            segments.append({
+                "id": f"{way_id}:{index}",
+                "way_id": way_id,
+                "index": index,
+                "name": name,
+                "highway": highway,
+                "path": [[round(lat1, 7), round(lon1, 7)], [round(lat2, 7), round(lon2, 7)]],
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "length_m": round(math.hypot(x2 - x1, y2 - y1), 1),
+            })
+    return segments
+
+
+def build_road_segment_index(segments):
+    grid = {}
+    for segment in segments:
+        min_x = min(segment["x1"], segment["x2"]) - ROAD_MATCH_MAX_METERS
+        max_x = max(segment["x1"], segment["x2"]) + ROAD_MATCH_MAX_METERS
+        min_y = min(segment["y1"], segment["y2"]) - ROAD_MATCH_MAX_METERS
+        max_y = max(segment["y1"], segment["y2"]) + ROAD_MATCH_MAX_METERS
+        x0, x1 = int(min_x // ROAD_GRID_METERS), int(max_x // ROAD_GRID_METERS)
+        y0, y1 = int(min_y // ROAD_GRID_METERS), int(max_y // ROAD_GRID_METERS)
+        for gx in range(x0, x1 + 1):
+            for gy in range(y0, y1 + 1):
+                grid.setdefault((gx, gy), []).append(segment)
+    return grid
+
+
+def nearest_road_segment(point, road_grid, ref_lat, max_m):
+    px, py = project(point[1], point[0], ref_lat)
+    ix = int(px // ROAD_GRID_METERS)
+    iy = int(py // ROAD_GRID_METERS)
+    cells = int(math.ceil(max_m / ROAD_GRID_METERS)) + 1
+    best = (float("inf"), None)
+    seen = set()
+    for dx in range(-cells, cells + 1):
+        for dy in range(-cells, cells + 1):
+            for segment in road_grid.get((ix + dx, iy + dy), []):
+                if segment["id"] in seen:
+                    continue
+                seen.add(segment["id"])
+                dist = point_segment_distance_xy(px, py, segment)
+                if dist < best[0]:
+                    best = (dist, segment)
+    if best[1] is None or best[0] > max_m:
+        return None, None
+    return best[1], best[0]
+
+
+def finish_low_confidence_run(runs, current):
+    if not current or current["points"] < LOW_CONFIDENCE_MIN_POINTS:
+        return
+    run = {
+        "start_time": current["start_time"],
+        "end_time": current["end_time"],
+        "points": current["points"],
+        "raw_records": current["raw_records"],
+        "reason": current["reason"],
+        "sample_points": current["sample_points"],
+    }
+    runs.append(run)
+
+
+def add_osrm_sample(current, point):
+    sample = current["sample_points"]
+    if len(sample) < OSRM_MAX_POINTS:
+        sample.append([point["lon"], point["lat"]])
+        return
+    replace_every = max(1, current["points"] // OSRM_MAX_POINTS)
+    if current["points"] % replace_every == 0:
+        sample[-1] = [point["lon"], point["lat"]]
+
+
+def match_points_to_roads(points, file_name, road_grid, ref_lat):
+    matched_by_segment = {}
+    low_runs = []
+    current_low = None
+    matched_points = 0
+    matched_records = 0
+    unmatched_points = 0
+    unmatched_records = 0
+    max_distance = 0
+
+    progress_step = 200_000
+    for index, point in enumerate(points, start=1):
+        if index == 1 or index % progress_step == 0:
+            print(f"Matching {file_name}: {index:,}/{len(points):,}", flush=True)
+        segment, dist = nearest_road_segment((point["lat"], point["lon"]), road_grid, ref_lat, ROAD_MATCH_MAX_METERS)
+        if segment:
+            finish_low_confidence_run(low_runs, current_low)
+            current_low = None
+            matched_points += 1
+            matched_records += point["count"]
+            max_distance = max(max_distance, dist)
+            stats = matched_by_segment.setdefault(segment["id"], {
+                "count": 0,
+                "raw_records": 0,
+                "first_time": point["start_time"],
+                "last_time": point["end_time"],
+                "max_distance_m": 0,
+            })
+            stats["count"] += 1
+            stats["raw_records"] += point["count"]
+            stats["first_time"] = min(stats["first_time"], point["start_time"])
+            stats["last_time"] = max(stats["last_time"], point["end_time"])
+            stats["max_distance_m"] = max(stats["max_distance_m"], round(dist, 1))
+            continue
+
+        unmatched_points += 1
+        unmatched_records += point["count"]
+        if current_low is None:
+            current_low = {
+                "start_time": point["start_time"],
+                "end_time": point["end_time"],
+                "points": 0,
+                "raw_records": 0,
+                "reason": "no_road_within_threshold",
+                "sample_points": [],
+            }
+        current_low["end_time"] = point["end_time"]
+        current_low["points"] += 1
+        current_low["raw_records"] += point["count"]
+        add_osrm_sample(current_low, point)
+    finish_low_confidence_run(low_runs, current_low)
+
+    match_rate = matched_points / len(points) if points else 0
+    print(f"Matched {file_name}: {matched_points:,}/{len(points):,} ({match_rate:.1%})", flush=True)
+    return {
+        "file": file_name,
+        "matched_by_segment": matched_by_segment,
+        "low_confidence_segments": low_runs,
+        "summary": {
+            "matched_points": matched_points,
+            "matched_raw_records": matched_records,
+            "unmatched_points": unmatched_points,
+            "unmatched_raw_records": unmatched_records,
+            "match_rate": round(match_rate, 4),
+            "matched_segments": len(matched_by_segment),
+            "low_confidence_segments": len(low_runs),
+            "max_local_distance_m": round(max_distance, 1),
+        },
+    }
+
+
+def build_route_vertex_index_from_segments(segment_ids, segments_by_id, ref_lat):
+    grid = {}
+    for segment_id in segment_ids:
+        segment = segments_by_id.get(segment_id)
+        if not segment:
+            continue
+        points = [
+            segment["path"][0],
+            segment["path"][1],
+            [
+                round((segment["path"][0][0] + segment["path"][1][0]) / 2, 7),
+                round((segment["path"][0][1] + segment["path"][1][1]) / 2, 7),
+            ],
+        ]
+        for lat, lon in points:
+            x, y = project(lon, lat, ref_lat)
+            key = (int(x // GRID_SIZE_METERS), int(y // GRID_SIZE_METERS))
+            grid.setdefault(key, []).append((x, y))
+    return grid
+
+
+def nearest_route_vertex_m(point, grid, ref_lat):
+    x, y = project(point[1], point[0], ref_lat)
+    ix = int(x // GRID_SIZE_METERS)
+    iy = int(y // GRID_SIZE_METERS)
+    best = float("inf")
+    cells = int(math.ceil(ROUTE_SNAP_METERS / GRID_SIZE_METERS)) + 1
+    for dx in range(-cells, cells + 1):
+        for dy in range(-cells, cells + 1):
+            for rx, ry in grid.get((ix + dx, iy + dy), []):
+                dist = math.hypot(x - rx, y - ry)
+                if dist < best:
+                    best = dist
+    return best
+
+
 def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
     selected = []
     seen = set()
@@ -356,6 +514,7 @@ def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
             poi["route_distances_m"] = dict(sorted(distances.items()))
             poi["distance_m"] = min(distances.values())
             poi["stop_files"] = []
+            poi["candidate_stop_files"] = []
             poi["stop_stats"] = {}
             selected.append(poi)
             seen.add(key)
@@ -363,8 +522,9 @@ def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
     return selected
 
 
-def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat):
+def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, traffic_signals, ref_lat):
     bus_stop_index = build_poi_index(all_bus_stops, ref_lat, STOP_TO_BUS_STOP_METERS)
+    signal_index = build_poi_index(traffic_signals, ref_lat, TRAFFIC_SIGNAL_FILTER_METERS)
     evidence = {}
     for event in stop_events:
         station, dist = nearest_indexed_item(
@@ -376,6 +536,13 @@ def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat):
         )
         if not station:
             continue
+        signal, signal_dist = nearest_indexed_item(
+            (event["lat"], event["lon"]),
+            signal_index,
+            ref_lat,
+            TRAFFIC_SIGNAL_FILTER_METERS,
+            TRAFFIC_SIGNAL_FILTER_METERS,
+        )
         station_id = station["id"]
         by_file = evidence.setdefault(station_id, {})
         stats = by_file.setdefault(event["file"], {
@@ -385,6 +552,9 @@ def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat):
             "first_time": event["start_time"],
             "last_time": event["end_time"],
             "nearest_stop_event_m": round(dist, 1),
+            "near_traffic_signal_events": 0,
+            "nearest_traffic_signal_m": None,
+            "dates": set(),
         })
         stats["events"] += 1
         stats["total_dwell_s"] += event["duration_s"]
@@ -392,15 +562,156 @@ def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat):
         stats["first_time"] = min(stats["first_time"], event["start_time"])
         stats["last_time"] = max(stats["last_time"], event["end_time"])
         stats["nearest_stop_event_m"] = min(stats["nearest_stop_event_m"], round(dist, 1))
+        event_date = event["start_time"][:10]
+        if event_date:
+            stats["dates"].add(event_date)
+        if signal:
+            stats["near_traffic_signal_events"] += 1
+            rounded = round(signal_dist, 1)
+            if stats["nearest_traffic_signal_m"] is None:
+                stats["nearest_traffic_signal_m"] = rounded
+            else:
+                stats["nearest_traffic_signal_m"] = min(stats["nearest_traffic_signal_m"], rounded)
 
     poi_by_id = {poi["id"]: poi for poi in osm_pois if poi["kind"] == "bus_stop"}
+    confirmed_count = 0
+    candidate_count = 0
     for station_id, by_file in evidence.items():
         poi = poi_by_id.get(station_id)
         if not poi:
             continue
-        poi["stop_files"] = sorted(by_file)
-        poi["stop_stats"] = dict(sorted(by_file.items()))
-    return evidence
+        normalized = {}
+        confirmed_files = []
+        candidate_files = []
+        for file_name, stats in sorted(by_file.items()):
+            service_days = len(stats["dates"])
+            status = "confirmed"
+            if stats["events"] < CONFIRMED_STOP_MIN_EVENTS or service_days < CONFIRMED_STOP_MIN_DAYS:
+                status = "candidate"
+            if status == "confirmed":
+                confirmed_files.append(file_name)
+            else:
+                candidate_files.append(file_name)
+            normalized[file_name] = {
+                "events": stats["events"],
+                "service_days": service_days,
+                "total_dwell_s": stats["total_dwell_s"],
+                "max_dwell_s": stats["max_dwell_s"],
+                "first_time": stats["first_time"],
+                "last_time": stats["last_time"],
+                "nearest_stop_event_m": stats["nearest_stop_event_m"],
+                "near_traffic_signal_events": stats["near_traffic_signal_events"],
+                "nearest_traffic_signal_m": stats["nearest_traffic_signal_m"],
+                "status": status,
+            }
+        poi["stop_files"] = confirmed_files
+        poi["candidate_stop_files"] = candidate_files
+        poi["stop_stats"] = normalized
+        if confirmed_files:
+            confirmed_count += 1
+        if candidate_files and not confirmed_files:
+            candidate_count += 1
+    return {
+        "stations_with_evidence": len(evidence),
+        "confirmed_stations": confirmed_count,
+        "candidate_only_stations": candidate_count,
+    }
+
+
+def osrm_match_segment(sample_points):
+    if len(sample_points) < LOW_CONFIDENCE_MIN_POINTS:
+        return None
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lon, lat in sample_points[:OSRM_MAX_POINTS])
+    radiuses = ";".join(["35"] * min(len(sample_points), OSRM_MAX_POINTS))
+    query = urllib.parse.urlencode({
+        "geometries": "geojson",
+        "overview": "full",
+        "radiuses": radiuses,
+    })
+    url = f"https://router.project-osrm.org/match/v1/driving/{coords}?{query}"
+    request = urllib.request.Request(url, headers={"User-Agent": "Codex local bus route map"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.load(response)
+    if data.get("code") != "Ok" or not data.get("matchings"):
+        return None
+    best = max(data["matchings"], key=lambda item: item.get("confidence", 0))
+    if best.get("confidence", 0) < 0.45:
+        return None
+    coordinates = best.get("geometry", {}).get("coordinates") or []
+    path = [[round(lat, 7), round(lon, 7)] for lon, lat in coordinates if valid_coord(lon, lat)]
+    if len(path) < 2:
+        return None
+    return {
+        "path": path,
+        "confidence": round(best.get("confidence", 0), 3),
+        "source": "osrm",
+    }
+
+
+def refine_low_confidence_with_osrm(file_name, runs):
+    if os.environ.get("USE_OSRM", "1") == "0":
+        return [], {"enabled": False, "success": 0, "failed": 0, "skipped": len(runs), "reason": "USE_OSRM=0"}
+    refined = []
+    failed = 0
+    skipped = max(0, len(runs) - OSRM_MAX_SEGMENTS_PER_ROUTE)
+    for index, run in enumerate(runs[:OSRM_MAX_SEGMENTS_PER_ROUTE]):
+        try:
+            result = osrm_match_segment(run["sample_points"])
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+            result = None
+        if not result:
+            failed += 1
+            continue
+        refined.append({
+            "id": f"osrm:{file_name}:{index}",
+            "path": result["path"],
+            "name": "OSRM 精修片段",
+            "highway": "",
+            "files": [file_name],
+            "match_counts_by_file": {file_name: run["raw_records"]},
+            "matched_points_by_file": {file_name: run["points"]},
+            "source": "osrm",
+            "refined_from": run["reason"],
+            "confidence": result["confidence"],
+        })
+    return refined, {
+        "enabled": True,
+        "success": len(refined),
+        "failed": failed,
+        "skipped": skipped,
+        "reason": "only low-confidence short segments are sent to OSRM",
+    }
+
+
+def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
+    records = []
+    for segment_id, segment in segments_by_id.items():
+        files = []
+        counts = {}
+        max_distance = 0
+        for file_name, match in matches_by_file.items():
+            stats = match["matched_by_segment"].get(segment_id)
+            if not stats:
+                continue
+            files.append(file_name)
+            counts[file_name] = stats["raw_records"]
+            max_distance = max(max_distance, stats["max_distance_m"])
+        if not files:
+            continue
+        records.append({
+            "id": segment_id,
+            "path": segment["path"],
+            "name": segment["name"],
+            "highway": segment["highway"],
+            "length_m": segment["length_m"],
+            "files": sorted(files),
+            "match_counts_by_file": dict(sorted(counts.items())),
+            "source": "local_osm",
+            "max_distance_m": round(max_distance, 1),
+        })
+    records.extend(osrm_segments)
+    records.sort(key=lambda item: (item["source"], item["id"]))
+    return records
 
 
 def build_html(data_json_name):
@@ -419,7 +730,7 @@ def build_html(data_json_name):
       right: 12px;
       bottom: 24px;
       z-index: 900;
-      width: min(360px, calc(100vw - 24px));
+      width: min(390px, calc(100vw - 24px));
       background: rgba(255, 255, 255, 0.94);
       border: 1px solid #d9dee7;
       border-radius: 8px;
@@ -431,7 +742,7 @@ def build_html(data_json_name):
       top: 84px;
       left: 12px;
       z-index: 1000;
-      width: 210px;
+      width: 230px;
       background: rgba(255, 255, 255, 0.94);
       border: 1px solid #d9dee7;
       border-radius: 8px;
@@ -488,6 +799,12 @@ def build_html(data_json_name):
       font-size: 12px;
       line-height: 1.85;
     }}
+    .match-list {{
+      margin-top: 6px;
+      display: grid;
+      gap: 3px;
+      line-height: 1.45;
+    }}
     .dot {{
       display: inline-block;
       width: 10px;
@@ -541,14 +858,14 @@ def build_html(data_json_name):
       .route-panel {{
         top: 82px;
         left: 10px;
-        width: min(210px, calc(100vw - 20px));
+        width: min(230px, calc(100vw - 20px));
       }}
       .panel {{
         left: 10px;
         right: 10px;
-        bottom: 18px;
+        bottom: 62px;
         width: auto;
-        max-height: 38vh;
+        max-height: 34vh;
         overflow: auto;
       }}
       .ui-toggle {{
@@ -588,7 +905,7 @@ def build_html(data_json_name):
     const linkedMarkerRecords = [];
     let activeFiles = new Set();
     const overlays = {{
-      "行驶路径": routeLayers,
+      "道路化行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
       "充电位置": chargingLayer,
       "公交站点": stationLayer,
@@ -606,51 +923,19 @@ def build_html(data_json_name):
       }}).bindPopup(label);
     }}
 
-    function decodePolyline6(encoded, count) {{
-      const coords = new Int32Array(count * 2);
-      let index = 0;
-      let lat = 0;
-      let lon = 0;
-      let out = 0;
-      while (index < encoded.length && out < coords.length) {{
-        let shift = 0;
-        let result = 0;
-        let byte = 0;
-        do {{
-          byte = encoded.charCodeAt(index++) - 63;
-          result |= (byte & 0x1f) << shift;
-          shift += 5;
-        }} while (byte >= 0x20);
-        lat += (result & 1) ? ~(result >> 1) : (result >> 1);
-
-        shift = 0;
-        result = 0;
-        do {{
-          byte = encoded.charCodeAt(index++) - 63;
-          result |= (byte & 0x1f) << shift;
-          shift += 5;
-        }} while (byte >= 0x20);
-        lon += (result & 1) ? ~(result >> 1) : (result >> 1);
-
-        coords[out++] = lat;
-        coords[out++] = lon;
-      }}
-      return coords;
-    }}
-
     const CanvasRouteLayer = L.Layer.extend({{
-      initialize(routes) {{
-        this.routes = routes.map((route, index) => ({{
-          file: route.file,
-          color: colors[index % colors.length],
-          coords: decodePolyline6(route.encoded_path, route.compressed_count),
-          visible: true
+      initialize(segments, routes) {{
+        this.segments = segments.map(segment => ({{
+          ...segment,
+          projected: [],
+          bounds: null
         }}));
+        this.routeColor = new Map(routes.map((route, index) => [route.file, colors[index % colors.length]]));
+        this.visibleFiles = new Set(routes.map(route => route.file));
       }},
       setVisible(file, visible) {{
-        const route = this.routes.find(item => item.file === file);
-        if (!route) return;
-        route.visible = visible;
+        if (visible) this.visibleFiles.add(file);
+        else this.visibleFiles.delete(file);
         if (this.map) this.reset();
       }},
       onAdd(mapInstance) {{
@@ -659,11 +944,16 @@ def build_html(data_json_name):
         this.ctx = this.canvas.getContext("2d");
         mapInstance.getPanes().overlayPane.appendChild(this.canvas);
         mapInstance.on("move zoom resize zoomend", this.reset, this);
+        mapInstance.on("click", this.handleClick, this);
         this.reset();
       }},
       onRemove(mapInstance) {{
         mapInstance.off("move zoom resize zoomend", this.reset, this);
+        mapInstance.off("click", this.handleClick, this);
         this.canvas.remove();
+      }},
+      segmentActiveFiles(segment) {{
+        return (segment.files || []).filter(file => this.visibleFiles.has(file));
       }},
       reset() {{
         const size = this.map.getSize();
@@ -679,35 +969,65 @@ def build_html(data_json_name):
         ctx.clearRect(0, 0, size.x, size.y);
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
-        const visibleRoutes = this.routes
-          .filter(route => route.visible)
-          .sort((a, b) => {{
-            if (a.file === "01.csv") return 1;
-            if (b.file === "01.csv") return -1;
-            return 0;
-          }});
-        const drawRoute = (route, strokeStyle, lineWidth, alpha) => {{
-          if (!route.visible) return;
-          const coords = route.coords;
-          if (coords.length < 4) return;
+
+        const drawSegment = (segment, strokeStyle, lineWidth, alpha) => {{
+          const pts = segment.path.map(([lat, lon]) => this.map.latLngToContainerPoint([lat, lon]));
+          segment.projected = pts;
+          if (pts.length < 2) return;
           ctx.beginPath();
           ctx.strokeStyle = strokeStyle;
           ctx.lineWidth = lineWidth;
           ctx.globalAlpha = alpha;
-          for (let i = 0; i < coords.length; i += 2) {{
-            const pt = this.map.latLngToContainerPoint([coords[i] / 1e6, coords[i + 1] / 1e6]);
-            if (i === 0) ctx.moveTo(pt.x, pt.y);
-            else ctx.lineTo(pt.x, pt.y);
-          }}
+          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
           ctx.stroke();
         }};
-        for (const route of visibleRoutes) {{
-          drawRoute(route, "rgba(255, 255, 255, 0.92)", 7, 0.78);
-          drawRoute(route, route.color, route.file === "01.csv" ? 4.8 : 3.6, route.file === "01.csv" ? 0.98 : 0.86);
+
+        const activeSegments = this.segments
+          .map(segment => [segment, this.segmentActiveFiles(segment)])
+          .filter(([, files]) => files.length);
+        for (const [segment] of activeSegments) {{
+          drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 8 : 6.4, 0.82);
+        }}
+        for (const [segment, files] of activeSegments) {{
+          const color = files.includes("01.csv") ? this.routeColor.get("01.csv") : this.routeColor.get(files[0]);
+          const width = segment.source === "osrm" ? 4.8 : (files.includes("01.csv") ? 4.4 : 3.4);
+          drawSegment(segment, color || "#2563eb", width, segment.source === "osrm" ? 0.96 : 0.86);
         }}
         ctx.globalAlpha = 1;
+      }},
+      handleClick(event) {{
+        const click = this.map.latLngToContainerPoint(event.latlng);
+        let best = null;
+        for (const segment of this.segments) {{
+          const files = this.segmentActiveFiles(segment);
+          if (!files.length || !segment.projected || segment.projected.length < 2) continue;
+          for (let i = 0; i < segment.projected.length - 1; i++) {{
+            const dist = pointLineDistance(click, segment.projected[i], segment.projected[i + 1]);
+            if (dist <= 8 && (!best || dist < best.dist)) best = {{ segment, files, dist }};
+          }}
+        }}
+        if (!best) return;
+        const segment = best.segment;
+        const counts = Object.entries(segment.match_counts_by_file || {{}})
+          .filter(([file]) => best.files.includes(file))
+          .map(([file, count]) => `<code>${{escapeHtml(file)}}</code>：${{Number(count || 0).toLocaleString()}} 条`)
+          .join("<br>");
+        L.popup()
+          .setLatLng(event.latlng)
+          .setContent(`<strong>道路化轨迹</strong><br>道路名：${{escapeHtml(segment.name || "未命名道路")}}<br>道路等级：${{escapeHtml(segment.highway || "未知")}}<br>来源：${{segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 匹配"}}<br>关联 CSV：${{formatFiles(best.files)}}<br>匹配记录：<br>${{counts || "无"}}`)
+          .openOn(this.map);
       }}
     }});
+
+    function pointLineDistance(p, a, b) {{
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      if (dx === 0 && dy === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+      const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)));
+      const cx = a.x + t * dx;
+      const cy = a.y + t * dy;
+      return Math.hypot(p.x - cx, p.y - cy);
+    }}
 
     function escapeHtml(value) {{
       return String(value ?? "").replace(/[&<>"']/g, ch => ({{
@@ -726,6 +1046,10 @@ def build_html(data_json_name):
       return minutes > 0 ? `${{minutes}}分${{rest}}秒` : `${{rest}}秒`;
     }}
 
+    function formatPercent(value) {{
+      return `${{(Number(value || 0) * 100).toFixed(1)}}%`;
+    }}
+
     function formatFiles(files) {{
       return (files || []).map(file => `<code>${{escapeHtml(file)}}</code>`).join("、") || "无";
     }}
@@ -737,9 +1061,7 @@ def build_html(data_json_name):
     function addLinkedMarker(group, marker, files) {{
       const record = {{ group, marker, files: files || [] }};
       linkedMarkerRecords.push(record);
-      if (hasActiveFile(record.files)) {{
-        marker.addTo(group);
-      }}
+      if (hasActiveFile(record.files)) marker.addTo(group);
     }}
 
     function refreshLinkedMarkers() {{
@@ -765,7 +1087,7 @@ def build_html(data_json_name):
       container.innerHTML = routes.map((route, index) => `
         <label class="route-toggle">
           <input type="checkbox" data-file="${{escapeHtml(route.file)}}" checked>
-          <span><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>
+          <span><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}} · ${{formatPercent(route.road_match.match_rate)}}</span>
         </label>
       `).join("");
       container.querySelectorAll("input[type='checkbox']").forEach(input => {{
@@ -792,9 +1114,8 @@ def build_html(data_json_name):
       .then(data => {{
         const bounds = [];
         activeFiles = new Set(data.routes.map(route => route.file));
-        const canvasRoutes = new CanvasRouteLayer(data.routes).addTo(routeLayers);
+        const canvasRoutes = new CanvasRouteLayer(data.road_segments || [], data.routes).addTo(routeLayers);
         data.routes.forEach((route, index) => {{
-          const color = colors[index % colors.length];
           bounds.push([route.start.lat, route.start.lon], [route.end.lat, route.end.lon]);
           const endpointLayer = L.layerGroup();
           circle(route.start.lat, route.start.lon, "#0f766e", 8, `<strong>${{escapeHtml(route.file)}} 起点</strong><br>${{escapeHtml(route.start.time)}}<br>SOC：${{escapeHtml(route.start.soc)}}`).addTo(endpointLayer);
@@ -816,20 +1137,20 @@ def build_html(data_json_name):
         }});
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {{
-          const hasStopEvidence = item.stop_files && item.stop_files.length;
-          const statsHtml = hasStopEvidence
-            ? Object.entries(item.stop_stats).map(([file, stats]) =>
-                `<br><code>${{escapeHtml(file)}}</code>：停靠 ${{stats.events}} 次，累计 ${{formatDuration(stats.total_dwell_s)}}，最长 ${{formatDuration(stats.max_dwell_s)}}`
-              ).join("")
-            : "<br>停靠证据：未检测到达到阈值的停靠";
-          const marker = circle(item.lat, item.lon, hasStopEvidence ? "#1d4ed8" : "#64748b", hasStopEvidence ? 5.6 : 3.6,
-            `<strong>${{hasStopEvidence ? "停靠站点" : "沿线站点"}}</strong><br>${{escapeHtml(item.name || "未命名站点")}}<br>轨迹关联：${{formatFiles(item.files)}}<br>停靠归属：${{formatFiles(item.stop_files)}}${{statsHtml}}`,
-            hasStopEvidence ? "#60a5fa" : "#cbd5e1");
+          const hasConfirmed = item.stop_files && item.stop_files.length;
+          const hasCandidate = item.candidate_stop_files && item.candidate_stop_files.length;
+          const statsHtml = Object.entries(item.stop_stats || {{}}).map(([file, stats]) =>
+            `<br><code>${{escapeHtml(file)}}</code>：${{stats.status === "confirmed" ? "正式" : "候选"}}，停靠 ${{stats.events}} 次，跨 ${{stats.service_days}} 天，累计 ${{formatDuration(stats.total_dwell_s)}}，最长 ${{formatDuration(stats.max_dwell_s)}}${{stats.nearest_traffic_signal_m !== null ? `，近红绿灯 ${{stats.nearest_traffic_signal_m}}m` : ""}}`
+          ).join("") || "<br>停靠证据：未达到重复停靠阈值";
+          const label = hasConfirmed ? "正式停靠站" : (hasCandidate ? "候选站点" : "沿线站点");
+          const marker = circle(item.lat, item.lon, hasConfirmed ? "#1d4ed8" : (hasCandidate ? "#ca8a04" : "#64748b"), hasConfirmed ? 5.8 : (hasCandidate ? 4.8 : 3.4),
+            `<strong>${{label}}</strong><br>${{escapeHtml(item.name || "未命名站点")}}<br>轨迹关联：${{formatFiles(item.files)}}<br>正式归属：${{formatFiles(item.stop_files)}}<br>候选归属：${{formatFiles(item.candidate_stop_files)}}${{statsHtml}}`,
+            hasConfirmed ? "#60a5fa" : (hasCandidate ? "#fde047" : "#cbd5e1"));
           addLinkedMarker(stationLayer, marker, item.files);
         }});
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {{
           const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
-            `<strong>红绿灯</strong><br>${{escapeHtml(item.name || "交通信号灯")}}<br>关联 CSV：${{formatFiles(item.files)}}<br>最近轨迹距离：${{item.distance_m}} m`,
+            `<strong>红绿灯</strong><br>${{escapeHtml(item.name || "交通信号灯")}}<br>关联 CSV：${{formatFiles(item.files)}}<br>最近道路化轨迹距离：${{item.distance_m}} m`,
             "#fecaca");
           addLinkedMarker(signalLayer, marker, item.files);
         }});
@@ -838,19 +1159,29 @@ def build_html(data_json_name):
           map.fitBounds(bounds, {{ padding: [28, 28] }});
         }}
 
+        const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
+        const matchRows = data.routes.map(route =>
+          `<div><code>${{escapeHtml(route.file)}}</code> 本地 ${{formatPercent(route.road_match.match_rate)}} / 精修后 ${{formatPercent(route.road_match.refined_match_rate)}}，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+        ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
           <div class="stat"><strong>${{data.summary.total_raw_points.toLocaleString()}}</strong>原始定位点</div>
-          <div class="stat"><strong>${{data.charging_locations.length}}</strong>充电位置</div>
-          <div class="stat"><strong>${{data.osm_counts.stop_bus_stop || 0}}</strong>停靠站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
+          <div class="stat"><strong>${{data.road_segments.length.toLocaleString()}}</strong>道路化片段</div>
+          <div class="stat"><strong>${{data.osm_counts.confirmed_stop_bus_stop || 0}}</strong>正式站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
         `;
         document.getElementById("legend").innerHTML = `
           <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
-          <div>路径使用全量数据；仅合并连续相同经纬度：${{data.summary.total_compressed_points.toLocaleString()}} 个绘制点，合并 ${{data.summary.total_merged_repeats.toLocaleString()}} 条重复记录</div>
+          <div>主轨迹已道路化：本地 OSM 匹配为主，低置信短片段可经 OSRM 精修；原始 GPS 折线不在主视图绘制。</div>
+          <div class="match-list">${{matchRows}}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#60a5fa"></span>停靠站点 <span class="dot" style="background:#cbd5e1;margin-left:12px"></span>沿线站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
-          <div>CSV 勾选会联动隐藏/显示对应轨迹、充电位置、站点、红绿灯。</div>
+          <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+          <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${{data.summary.confirmed_stop_min_events}} 次、跨至少 ${{data.summary.confirmed_stop_min_days}} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
+          <div>CSV 勾选会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${{lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}}</div>
         `;
+      }})
+      .catch(error => {{
+        console.error(error);
+        document.getElementById("stats").innerHTML = `<div class="stat"><strong>错误</strong>数据加载失败</div>`;
       }});
   </script>
 </body>
@@ -860,8 +1191,7 @@ def build_html(data_json_name):
 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
-    routes = []
-    route_points_by_file = {}
+    csv_payloads = []
     charging_points = []
     stop_events = []
     total_raw_points = 0
@@ -870,6 +1200,7 @@ def main():
     bbox = [999, 999, -999, -999]
 
     for path in sorted(DATA_DIR.glob("*.csv")):
+        print(f"Reading {path.name}", flush=True)
         rows, charging = read_csv_points(path)
         if not rows:
             continue
@@ -880,36 +1211,73 @@ def main():
         total_raw_points += len(rows)
         total_compressed_points += len(compressed)
         total_merged_repeats += len(rows) - len(compressed)
-        route_points_by_file[path.name] = [(p["lat"], p["lon"]) for p in compressed]
         stop_events.extend(extract_stop_events(rows, path.name))
         for p in rows:
             bbox[0] = min(bbox[0], p["lon"])
             bbox[1] = min(bbox[1], p["lat"])
             bbox[2] = max(bbox[2], p["lon"])
             bbox[3] = max(bbox[3], p["lat"])
-        routes.append({
+        csv_payloads.append({
             "file": path.name,
-            "raw_count": len(rows),
-            "compressed_count": len(compressed),
-            "merged_repeated_points": len(rows) - len(compressed),
-            "start": rows[0],
-            "end": rows[-1],
-            "encoded_path": encode_polyline6(compressed),
+            "rows": rows,
+            "compressed": compressed,
         })
+        print(f"Loaded {path.name}: {len(rows):,} rows, {len(compressed):,} compressed", flush=True)
+
+    if not csv_payloads:
+        raise RuntimeError(f"No CSV files found in {DATA_DIR}")
 
     ref_lat = (bbox[1] + bbox[3]) / 2
+    road_segments = load_osm_roads(OSM_ROADS_FILE, ref_lat)
+    segments_by_id = {segment["id"]: segment for segment in road_segments}
+    road_grid = build_road_segment_index(road_segments)
+    matches_by_file = {}
+    route_grids_by_file = {}
+    routes = []
+    osrm_segments = []
+    osrm_summary_by_file = {}
+
+    for payload in csv_payloads:
+        file_name = payload["file"]
+        match = match_points_to_roads(payload["compressed"], file_name, road_grid, ref_lat)
+        refined_segments, osrm_summary = refine_low_confidence_with_osrm(file_name, match["low_confidence_segments"])
+        osrm_segments.extend(refined_segments)
+        osrm_summary_by_file[file_name] = osrm_summary
+        refined_points = sum(segment.get("matched_points_by_file", {}).get(file_name, 0) for segment in refined_segments)
+        refined_rate = (match["summary"]["matched_points"] + refined_points) / len(payload["compressed"])
+        match["summary"]["refined_match_rate"] = round(min(1, refined_rate), 4)
+        match["summary"]["osrm_refined_segments"] = osrm_summary["success"]
+        match["summary"]["osrm_failed_segments"] = osrm_summary["failed"]
+        match["summary"]["osrm_skipped_segments"] = osrm_summary["skipped"]
+        matches_by_file[file_name] = match
+        route_grids_by_file[file_name] = build_route_vertex_index_from_segments(match["matched_by_segment"], segments_by_id, ref_lat)
+        rows = payload["rows"]
+        routes.append({
+            "file": file_name,
+            "raw_count": len(rows),
+            "compressed_count": len(payload["compressed"]),
+            "merged_repeated_points": len(rows) - len(payload["compressed"]),
+            "start": rows[0],
+            "end": rows[-1],
+            "road_match": match["summary"],
+            "osrm_refinement": osrm_summary,
+        })
+
     charging_locations = cluster_points(charging_points, CHARGE_CLUSTER_METERS, "充电位置")
     pois = load_osm_poi(OSM_POI_FILE)
-    route_grids_by_file = {
-        file_name: build_route_vertex_index(points, ref_lat)
-        for file_name, points in route_points_by_file.items()
-    }
     osm_pois = annotate_pois_by_routes(pois, route_grids_by_file, ref_lat) if pois else []
     all_bus_stops = [poi for poi in pois if poi["kind"] == "bus_stop"]
-    stop_evidence = attach_stop_evidence(osm_pois, stop_events, all_bus_stops, ref_lat) if pois else {}
+    traffic_signals = [poi for poi in pois if poi["kind"] == "traffic_signal"]
+    stop_evidence = attach_stop_evidence(osm_pois, stop_events, all_bus_stops, traffic_signals, ref_lat) if pois else {
+        "stations_with_evidence": 0,
+        "confirmed_stations": 0,
+        "candidate_only_stations": 0,
+    }
+    output_road_segments = build_road_segments_output(segments_by_id, matches_by_file, osrm_segments)
     osm_counts = {
         "bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop"),
-        "stop_bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop" and p.get("stop_files")),
+        "confirmed_stop_bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop" and p.get("stop_files")),
+        "candidate_stop_bus_stop": sum(1 for p in osm_pois if p["kind"] == "bus_stop" and p.get("candidate_stop_files")),
         "traffic_signal": sum(1 for p in osm_pois if p["kind"] == "traffic_signal"),
     }
 
@@ -920,16 +1288,23 @@ def main():
             "total_merged_repeats": total_merged_repeats,
             "bbox": bbox,
             "poi_source": "OpenStreetMap Overpass API",
+            "road_source": "OpenStreetMap Overpass API",
+            "road_match_max_meters": ROAD_MATCH_MAX_METERS,
             "route_snap_meters": ROUTE_SNAP_METERS,
             "stop_speed_kmh": STOP_SPEED_KMH,
             "stop_min_seconds": STOP_MIN_SECONDS,
             "stop_max_seconds": STOP_MAX_SECONDS,
             "stop_to_bus_stop_meters": STOP_TO_BUS_STOP_METERS,
+            "confirmed_stop_min_events": CONFIRMED_STOP_MIN_EVENTS,
+            "confirmed_stop_min_days": CONFIRMED_STOP_MIN_DAYS,
+            "traffic_signal_filter_meters": TRAFFIC_SIGNAL_FILTER_METERS,
             "stop_events": len(stop_events),
-            "matched_stop_stations": len(stop_evidence),
-            "compression": "Only consecutive identical latitude/longitude records are merged. No route sampling is used.",
+            "stop_evidence": stop_evidence,
+            "osrm_summary_by_file": osrm_summary_by_file,
+            "compression": "Only consecutive identical latitude/longitude records are merged. The main map draws matched road geometry instead of raw GPS polylines.",
         },
         "routes": routes,
+        "road_segments": output_road_segments,
         "charging_locations": charging_locations,
         "osm_pois": osm_pois,
         "osm_counts": osm_counts,
@@ -942,9 +1317,18 @@ def main():
     print(f"Wrote {HTML_FILE}")
     print(f"Routes: {len(routes)}, raw points: {total_raw_points}")
     print(f"Compressed route points: {total_compressed_points}, merged repeats: {total_merged_repeats}")
+    print(f"Road segments loaded: {len(road_segments)}, drawn: {len(output_road_segments)}")
+    for route in routes:
+        match = route["road_match"]
+        print(
+            f"{route['file']}: local match {match['match_rate']:.1%}, "
+            f"refined {match['refined_match_rate']:.1%}, "
+            f"low confidence {match['low_confidence_segments']}, "
+            f"OSRM {match['osrm_refined_segments']} ok/{match['osrm_failed_segments']} failed"
+        )
     print(f"Charging clusters: {len(charging_locations)}")
-    print(f"Stop events: {len(stop_events)}, matched stop stations: {len(stop_evidence)}")
-    print(f"OSM POIs near route: {osm_counts}")
+    print(f"Stop events: {len(stop_events)}, stop evidence: {stop_evidence}")
+    print(f"OSM POIs near road-matched routes: {osm_counts}")
 
 
 if __name__ == "__main__":

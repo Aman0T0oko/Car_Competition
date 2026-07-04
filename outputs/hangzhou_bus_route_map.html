@@ -13,7 +13,7 @@
       right: 12px;
       bottom: 24px;
       z-index: 900;
-      width: min(360px, calc(100vw - 24px));
+      width: min(390px, calc(100vw - 24px));
       background: rgba(255, 255, 255, 0.94);
       border: 1px solid #d9dee7;
       border-radius: 8px;
@@ -25,7 +25,7 @@
       top: 84px;
       left: 12px;
       z-index: 1000;
-      width: 210px;
+      width: 230px;
       background: rgba(255, 255, 255, 0.94);
       border: 1px solid #d9dee7;
       border-radius: 8px;
@@ -82,6 +82,12 @@
       font-size: 12px;
       line-height: 1.85;
     }
+    .match-list {
+      margin-top: 6px;
+      display: grid;
+      gap: 3px;
+      line-height: 1.45;
+    }
     .dot {
       display: inline-block;
       width: 10px;
@@ -135,14 +141,14 @@
       .route-panel {
         top: 82px;
         left: 10px;
-        width: min(210px, calc(100vw - 20px));
+        width: min(230px, calc(100vw - 20px));
       }
       .panel {
         left: 10px;
         right: 10px;
-        bottom: 18px;
+        bottom: 62px;
         width: auto;
-        max-height: 38vh;
+        max-height: 34vh;
         overflow: auto;
       }
       .ui-toggle {
@@ -182,7 +188,7 @@
     const linkedMarkerRecords = [];
     let activeFiles = new Set();
     const overlays = {
-      "行驶路径": routeLayers,
+      "道路化行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
       "充电位置": chargingLayer,
       "公交站点": stationLayer,
@@ -200,51 +206,19 @@
       }).bindPopup(label);
     }
 
-    function decodePolyline6(encoded, count) {
-      const coords = new Int32Array(count * 2);
-      let index = 0;
-      let lat = 0;
-      let lon = 0;
-      let out = 0;
-      while (index < encoded.length && out < coords.length) {
-        let shift = 0;
-        let result = 0;
-        let byte = 0;
-        do {
-          byte = encoded.charCodeAt(index++) - 63;
-          result |= (byte & 0x1f) << shift;
-          shift += 5;
-        } while (byte >= 0x20);
-        lat += (result & 1) ? ~(result >> 1) : (result >> 1);
-
-        shift = 0;
-        result = 0;
-        do {
-          byte = encoded.charCodeAt(index++) - 63;
-          result |= (byte & 0x1f) << shift;
-          shift += 5;
-        } while (byte >= 0x20);
-        lon += (result & 1) ? ~(result >> 1) : (result >> 1);
-
-        coords[out++] = lat;
-        coords[out++] = lon;
-      }
-      return coords;
-    }
-
     const CanvasRouteLayer = L.Layer.extend({
-      initialize(routes) {
-        this.routes = routes.map((route, index) => ({
-          file: route.file,
-          color: colors[index % colors.length],
-          coords: decodePolyline6(route.encoded_path, route.compressed_count),
-          visible: true
+      initialize(segments, routes) {
+        this.segments = segments.map(segment => ({
+          ...segment,
+          projected: [],
+          bounds: null
         }));
+        this.routeColor = new Map(routes.map((route, index) => [route.file, colors[index % colors.length]]));
+        this.visibleFiles = new Set(routes.map(route => route.file));
       },
       setVisible(file, visible) {
-        const route = this.routes.find(item => item.file === file);
-        if (!route) return;
-        route.visible = visible;
+        if (visible) this.visibleFiles.add(file);
+        else this.visibleFiles.delete(file);
         if (this.map) this.reset();
       },
       onAdd(mapInstance) {
@@ -253,11 +227,16 @@
         this.ctx = this.canvas.getContext("2d");
         mapInstance.getPanes().overlayPane.appendChild(this.canvas);
         mapInstance.on("move zoom resize zoomend", this.reset, this);
+        mapInstance.on("click", this.handleClick, this);
         this.reset();
       },
       onRemove(mapInstance) {
         mapInstance.off("move zoom resize zoomend", this.reset, this);
+        mapInstance.off("click", this.handleClick, this);
         this.canvas.remove();
+      },
+      segmentActiveFiles(segment) {
+        return (segment.files || []).filter(file => this.visibleFiles.has(file));
       },
       reset() {
         const size = this.map.getSize();
@@ -273,35 +252,65 @@
         ctx.clearRect(0, 0, size.x, size.y);
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
-        const visibleRoutes = this.routes
-          .filter(route => route.visible)
-          .sort((a, b) => {
-            if (a.file === "01.csv") return 1;
-            if (b.file === "01.csv") return -1;
-            return 0;
-          });
-        const drawRoute = (route, strokeStyle, lineWidth, alpha) => {
-          if (!route.visible) return;
-          const coords = route.coords;
-          if (coords.length < 4) return;
+
+        const drawSegment = (segment, strokeStyle, lineWidth, alpha) => {
+          const pts = segment.path.map(([lat, lon]) => this.map.latLngToContainerPoint([lat, lon]));
+          segment.projected = pts;
+          if (pts.length < 2) return;
           ctx.beginPath();
           ctx.strokeStyle = strokeStyle;
           ctx.lineWidth = lineWidth;
           ctx.globalAlpha = alpha;
-          for (let i = 0; i < coords.length; i += 2) {
-            const pt = this.map.latLngToContainerPoint([coords[i] / 1e6, coords[i + 1] / 1e6]);
-            if (i === 0) ctx.moveTo(pt.x, pt.y);
-            else ctx.lineTo(pt.x, pt.y);
-          }
+          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
           ctx.stroke();
         };
-        for (const route of visibleRoutes) {
-          drawRoute(route, "rgba(255, 255, 255, 0.92)", 7, 0.78);
-          drawRoute(route, route.color, route.file === "01.csv" ? 4.8 : 3.6, route.file === "01.csv" ? 0.98 : 0.86);
+
+        const activeSegments = this.segments
+          .map(segment => [segment, this.segmentActiveFiles(segment)])
+          .filter(([, files]) => files.length);
+        for (const [segment] of activeSegments) {
+          drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 8 : 6.4, 0.82);
+        }
+        for (const [segment, files] of activeSegments) {
+          const color = files.includes("01.csv") ? this.routeColor.get("01.csv") : this.routeColor.get(files[0]);
+          const width = segment.source === "osrm" ? 4.8 : (files.includes("01.csv") ? 4.4 : 3.4);
+          drawSegment(segment, color || "#2563eb", width, segment.source === "osrm" ? 0.96 : 0.86);
         }
         ctx.globalAlpha = 1;
+      },
+      handleClick(event) {
+        const click = this.map.latLngToContainerPoint(event.latlng);
+        let best = null;
+        for (const segment of this.segments) {
+          const files = this.segmentActiveFiles(segment);
+          if (!files.length || !segment.projected || segment.projected.length < 2) continue;
+          for (let i = 0; i < segment.projected.length - 1; i++) {
+            const dist = pointLineDistance(click, segment.projected[i], segment.projected[i + 1]);
+            if (dist <= 8 && (!best || dist < best.dist)) best = { segment, files, dist };
+          }
+        }
+        if (!best) return;
+        const segment = best.segment;
+        const counts = Object.entries(segment.match_counts_by_file || {})
+          .filter(([file]) => best.files.includes(file))
+          .map(([file, count]) => `<code>${escapeHtml(file)}</code>：${Number(count || 0).toLocaleString()} 条`)
+          .join("<br>");
+        L.popup()
+          .setLatLng(event.latlng)
+          .setContent(`<strong>道路化轨迹</strong><br>道路名：${escapeHtml(segment.name || "未命名道路")}<br>道路等级：${escapeHtml(segment.highway || "未知")}<br>来源：${segment.source === "osrm" ? "OSRM 精修" : "本地 OSM 匹配"}<br>关联 CSV：${formatFiles(best.files)}<br>匹配记录：<br>${counts || "无"}`)
+          .openOn(this.map);
       }
     });
+
+    function pointLineDistance(p, a, b) {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      if (dx === 0 && dy === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+      const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)));
+      const cx = a.x + t * dx;
+      const cy = a.y + t * dy;
+      return Math.hypot(p.x - cx, p.y - cy);
+    }
 
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -320,6 +329,10 @@
       return minutes > 0 ? `${minutes}分${rest}秒` : `${rest}秒`;
     }
 
+    function formatPercent(value) {
+      return `${(Number(value || 0) * 100).toFixed(1)}%`;
+    }
+
     function formatFiles(files) {
       return (files || []).map(file => `<code>${escapeHtml(file)}</code>`).join("、") || "无";
     }
@@ -331,9 +344,7 @@
     function addLinkedMarker(group, marker, files) {
       const record = { group, marker, files: files || [] };
       linkedMarkerRecords.push(record);
-      if (hasActiveFile(record.files)) {
-        marker.addTo(group);
-      }
+      if (hasActiveFile(record.files)) marker.addTo(group);
     }
 
     function refreshLinkedMarkers() {
@@ -359,7 +370,7 @@
       container.innerHTML = routes.map((route, index) => `
         <label class="route-toggle">
           <input type="checkbox" data-file="${escapeHtml(route.file)}" checked>
-          <span><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>
+          <span><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)} · ${formatPercent(route.road_match.match_rate)}</span>
         </label>
       `).join("");
       container.querySelectorAll("input[type='checkbox']").forEach(input => {
@@ -386,9 +397,8 @@
       .then(data => {
         const bounds = [];
         activeFiles = new Set(data.routes.map(route => route.file));
-        const canvasRoutes = new CanvasRouteLayer(data.routes).addTo(routeLayers);
+        const canvasRoutes = new CanvasRouteLayer(data.road_segments || [], data.routes).addTo(routeLayers);
         data.routes.forEach((route, index) => {
-          const color = colors[index % colors.length];
           bounds.push([route.start.lat, route.start.lon], [route.end.lat, route.end.lon]);
           const endpointLayer = L.layerGroup();
           circle(route.start.lat, route.start.lon, "#0f766e", 8, `<strong>${escapeHtml(route.file)} 起点</strong><br>${escapeHtml(route.start.time)}<br>SOC：${escapeHtml(route.start.soc)}`).addTo(endpointLayer);
@@ -410,20 +420,20 @@
         });
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {
-          const hasStopEvidence = item.stop_files && item.stop_files.length;
-          const statsHtml = hasStopEvidence
-            ? Object.entries(item.stop_stats).map(([file, stats]) =>
-                `<br><code>${escapeHtml(file)}</code>：停靠 ${stats.events} 次，累计 ${formatDuration(stats.total_dwell_s)}，最长 ${formatDuration(stats.max_dwell_s)}`
-              ).join("")
-            : "<br>停靠证据：未检测到达到阈值的停靠";
-          const marker = circle(item.lat, item.lon, hasStopEvidence ? "#1d4ed8" : "#64748b", hasStopEvidence ? 5.6 : 3.6,
-            `<strong>${hasStopEvidence ? "停靠站点" : "沿线站点"}</strong><br>${escapeHtml(item.name || "未命名站点")}<br>轨迹关联：${formatFiles(item.files)}<br>停靠归属：${formatFiles(item.stop_files)}${statsHtml}`,
-            hasStopEvidence ? "#60a5fa" : "#cbd5e1");
+          const hasConfirmed = item.stop_files && item.stop_files.length;
+          const hasCandidate = item.candidate_stop_files && item.candidate_stop_files.length;
+          const statsHtml = Object.entries(item.stop_stats || {}).map(([file, stats]) =>
+            `<br><code>${escapeHtml(file)}</code>：${stats.status === "confirmed" ? "正式" : "候选"}，停靠 ${stats.events} 次，跨 ${stats.service_days} 天，累计 ${formatDuration(stats.total_dwell_s)}，最长 ${formatDuration(stats.max_dwell_s)}${stats.nearest_traffic_signal_m !== null ? `，近红绿灯 ${stats.nearest_traffic_signal_m}m` : ""}`
+          ).join("") || "<br>停靠证据：未达到重复停靠阈值";
+          const label = hasConfirmed ? "正式停靠站" : (hasCandidate ? "候选站点" : "沿线站点");
+          const marker = circle(item.lat, item.lon, hasConfirmed ? "#1d4ed8" : (hasCandidate ? "#ca8a04" : "#64748b"), hasConfirmed ? 5.8 : (hasCandidate ? 4.8 : 3.4),
+            `<strong>${label}</strong><br>${escapeHtml(item.name || "未命名站点")}<br>轨迹关联：${formatFiles(item.files)}<br>正式归属：${formatFiles(item.stop_files)}<br>候选归属：${formatFiles(item.candidate_stop_files)}${statsHtml}`,
+            hasConfirmed ? "#60a5fa" : (hasCandidate ? "#fde047" : "#cbd5e1"));
           addLinkedMarker(stationLayer, marker, item.files);
         });
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {
           const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
-            `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>关联 CSV：${formatFiles(item.files)}<br>最近轨迹距离：${item.distance_m} m`,
+            `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>关联 CSV：${formatFiles(item.files)}<br>最近道路化轨迹距离：${item.distance_m} m`,
             "#fecaca");
           addLinkedMarker(signalLayer, marker, item.files);
         });
@@ -432,19 +442,29 @@
           map.fitBounds(bounds, { padding: [28, 28] });
         }
 
+        const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
+        const matchRows = data.routes.map(route =>
+          `<div><code>${escapeHtml(route.file)}</code> 本地 ${formatPercent(route.road_match.match_rate)} / 精修后 ${formatPercent(route.road_match.refined_match_rate)}，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
+        ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${data.routes.length}</strong>CSV 轨迹</div>
           <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
-          <div class="stat"><strong>${data.charging_locations.length}</strong>充电位置</div>
-          <div class="stat"><strong>${data.osm_counts.stop_bus_stop || 0}</strong>停靠站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
+          <div class="stat"><strong>${data.road_segments.length.toLocaleString()}</strong>道路化片段</div>
+          <div class="stat"><strong>${data.osm_counts.confirmed_stop_bus_stop || 0}</strong>正式站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
         `;
         document.getElementById("legend").innerHTML = `
           <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
-          <div>路径使用全量数据；仅合并连续相同经纬度：${data.summary.total_compressed_points.toLocaleString()} 个绘制点，合并 ${data.summary.total_merged_repeats.toLocaleString()} 条重复记录</div>
+          <div>主轨迹已道路化：本地 OSM 匹配为主，低置信短片段可经 OSRM 精修；原始 GPS 折线不在主视图绘制。</div>
+          <div class="match-list">${matchRows}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#60a5fa"></span>停靠站点 <span class="dot" style="background:#cbd5e1;margin-left:12px"></span>沿线站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
-          <div>CSV 勾选会联动隐藏/显示对应轨迹、充电位置、站点、红绿灯。</div>
+          <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+          <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${data.summary.confirmed_stop_min_events} 次、跨至少 ${data.summary.confirmed_stop_min_days} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
+          <div>CSV 勾选会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}</div>
         `;
+      })
+      .catch(error => {
+        console.error(error);
+        document.getElementById("stats").innerHTML = `<div class="stat"><strong>错误</strong>数据加载失败</div>`;
       });
   </script>
 </body>
