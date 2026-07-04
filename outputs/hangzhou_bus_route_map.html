@@ -269,22 +269,33 @@
         const ctx = this.ctx;
         ctx.setTransform(scale, 0, 0, scale, 0, 0);
         ctx.clearRect(0, 0, size.x, size.y);
-        ctx.lineWidth = 3.5;
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
-        for (const route of this.routes) {
-          if (!route.visible) continue;
+        const visibleRoutes = this.routes
+          .filter(route => route.visible)
+          .sort((a, b) => {
+            if (a.file === "01.csv") return 1;
+            if (b.file === "01.csv") return -1;
+            return 0;
+          });
+        const drawRoute = (route, strokeStyle, lineWidth, alpha) => {
+          if (!route.visible) return;
           const coords = route.coords;
-          if (coords.length < 4) continue;
+          if (coords.length < 4) return;
           ctx.beginPath();
-          ctx.strokeStyle = route.color;
-          ctx.globalAlpha = 0.82;
+          ctx.strokeStyle = strokeStyle;
+          ctx.lineWidth = lineWidth;
+          ctx.globalAlpha = alpha;
           for (let i = 0; i < coords.length; i += 2) {
             const pt = this.map.latLngToContainerPoint([coords[i] / 1e6, coords[i + 1] / 1e6]);
             if (i === 0) ctx.moveTo(pt.x, pt.y);
             else ctx.lineTo(pt.x, pt.y);
           }
           ctx.stroke();
+        };
+        for (const route of visibleRoutes) {
+          drawRoute(route, "rgba(255, 255, 255, 0.92)", 7, 0.78);
+          drawRoute(route, route.color, route.file === "01.csv" ? 4.8 : 3.6, route.file === "01.csv" ? 0.98 : 0.86);
         }
         ctx.globalAlpha = 1;
       }
