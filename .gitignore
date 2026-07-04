@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Raw bus telemetry data is large and should stay local.
+*.csv
+浙江杭州/

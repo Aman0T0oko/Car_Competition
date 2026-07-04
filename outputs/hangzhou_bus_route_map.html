@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>浙江杭州公交车行驶路径图</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .panel {
+      position: absolute;
+      right: 12px;
+      bottom: 24px;
+      z-index: 900;
+      width: min(360px, calc(100vw - 24px));
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      box-shadow: 0 12px 34px rgba(31, 41, 55, 0.18);
+      color: #152033;
+    }
+    .route-panel {
+      position: absolute;
+      top: 84px;
+      left: 12px;
+      z-index: 1000;
+      width: 210px;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      box-shadow: 0 12px 34px rgba(31, 41, 55, 0.18);
+      color: #152033;
+    }
+    .panel header, .route-panel header {
+      padding: 12px 14px 8px;
+      border-bottom: 1px solid #e5e9f0;
+      font-weight: 700;
+      font-size: 15px;
+    }
+    .route-list {
+      padding: 10px 12px 12px;
+      display: grid;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .route-toggle {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+      min-height: 24px;
+    }
+    .route-toggle input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }
+    .route-toggle span {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 12px 14px;
+      font-size: 12px;
+    }
+    .stat {
+      border: 1px solid #e0e5ed;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fbfcfe;
+    }
+    .stat strong { display: block; font-size: 17px; margin-bottom: 2px; }
+    .legend {
+      padding: 0 14px 12px;
+      font-size: 12px;
+      line-height: 1.85;
+    }
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+    .route-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin: 2px 6px 2px 0;
+      white-space: nowrap;
+    }
+    .line {
+      width: 22px;
+      height: 4px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .leaflet-popup-content { font-size: 13px; line-height: 1.5; }
+    .leaflet-control-layers {
+      border: 1px solid #d9dee7 !important;
+      border-radius: 8px !important;
+      box-shadow: 0 8px 24px rgba(31, 41, 55, 0.12) !important;
+    }
+    .ui-toggle {
+      position: absolute;
+      left: 12px;
+      bottom: 24px;
+      z-index: 1100;
+      min-width: 76px;
+      min-height: 34px;
+      border: 1px solid #cfd6e3;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 8px 22px rgba(31, 41, 55, 0.16);
+      color: #152033;
+      cursor: pointer;
+      font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .ui-toggle:hover {
+      background: #f8fafc;
+    }
+    body.ui-hidden .route-panel,
+    body.ui-hidden .panel {
+      display: none;
+    }
+    @media (max-width: 680px) {
+      .route-panel {
+        top: 82px;
+        left: 10px;
+        width: min(210px, calc(100vw - 20px));
+      }
+      .panel {
+        left: 10px;
+        right: 10px;
+        bottom: 18px;
+        width: auto;
+        max-height: 38vh;
+        overflow: auto;
+      }
+      .ui-toggle {
+        left: 10px;
+        bottom: 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <button class="ui-toggle" id="uiToggle" type="button" aria-pressed="false">隐藏 UI</button>
+  <aside class="route-panel">
+    <header>CSV 轨迹</header>
+    <div class="route-list" id="routeControls"></div>
+  </aside>
+  <aside class="panel">
+    <header>浙江杭州公交车行驶路径图</header>
+    <div class="stats" id="stats"></div>
+    <div class="legend" id="legend"></div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const colors = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c"];
+    const map = L.map("map", { preferCanvas: true });
+    const base = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+
+    const routeLayers = L.layerGroup().addTo(map);
+    const startEndLayers = L.layerGroup().addTo(map);
+    const chargingLayer = L.layerGroup().addTo(map);
+    const stationLayer = L.layerGroup().addTo(map);
+    const signalLayer = L.layerGroup().addTo(map);
+    const routeEndpointLayers = new Map();
+    const overlays = {
+      "行驶路径": routeLayers,
+      "起点 / 终点": startEndLayers,
+      "充电位置": chargingLayer,
+      "公交站点": stationLayer,
+      "红绿灯": signalLayer
+    };
+    L.control.layers({"OpenStreetMap": base}, overlays, { collapsed: false }).addTo(map);
+
+    function circle(lat, lon, color, radius, label, fill = color) {
+      return L.circleMarker([lat, lon], {
+        radius,
+        color,
+        weight: 2,
+        fillColor: fill,
+        fillOpacity: 0.88
+      }).bindPopup(label);
+    }
+
+    function decodePolyline6(encoded, count) {
+      const coords = new Int32Array(count * 2);
+      let index = 0;
+      let lat = 0;
+      let lon = 0;
+      let out = 0;
+      while (index < encoded.length && out < coords.length) {
+        let shift = 0;
+        let result = 0;
+        let byte = 0;
+        do {
+          byte = encoded.charCodeAt(index++) - 63;
+          result |= (byte & 0x1f) << shift;
+          shift += 5;
+        } while (byte >= 0x20);
+        lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+        shift = 0;
+        result = 0;
+        do {
+          byte = encoded.charCodeAt(index++) - 63;
+          result |= (byte & 0x1f) << shift;
+          shift += 5;
+        } while (byte >= 0x20);
+        lon += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+        coords[out++] = lat;
+        coords[out++] = lon;
+      }
+      return coords;
+    }
+
+    const CanvasRouteLayer = L.Layer.extend({
+      initialize(routes) {
+        this.routes = routes.map((route, index) => ({
+          file: route.file,
+          color: colors[index % colors.length],
+          coords: decodePolyline6(route.encoded_path, route.compressed_count),
+          visible: true
+        }));
+      },
+      setVisible(file, visible) {
+        const route = this.routes.find(item => item.file === file);
+        if (!route) return;
+        route.visible = visible;
+        if (this.map) this.reset();
+      },
+      onAdd(mapInstance) {
+        this.map = mapInstance;
+        this.canvas = L.DomUtil.create("canvas", "leaflet-zoom-animated");
+        this.ctx = this.canvas.getContext("2d");
+        mapInstance.getPanes().overlayPane.appendChild(this.canvas);
+        mapInstance.on("move zoom resize zoomend", this.reset, this);
+        this.reset();
+      },
+      onRemove(mapInstance) {
+        mapInstance.off("move zoom resize zoomend", this.reset, this);
+        this.canvas.remove();
+      },
+      reset() {
+        const size = this.map.getSize();
+        const topLeft = this.map.containerPointToLayerPoint([0, 0]);
+        L.DomUtil.setPosition(this.canvas, topLeft);
+        const scale = window.devicePixelRatio || 1;
+        this.canvas.width = size.x * scale;
+        this.canvas.height = size.y * scale;
+        this.canvas.style.width = `${size.x}px`;
+        this.canvas.style.height = `${size.y}px`;
+        const ctx = this.ctx;
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+        ctx.clearRect(0, 0, size.x, size.y);
+        ctx.lineWidth = 3.5;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        for (const route of this.routes) {
+          if (!route.visible) continue;
+          const coords = route.coords;
+          if (coords.length < 4) continue;
+          ctx.beginPath();
+          ctx.strokeStyle = route.color;
+          ctx.globalAlpha = 0.82;
+          for (let i = 0; i < coords.length; i += 2) {
+            const pt = this.map.latLngToContainerPoint([coords[i] / 1e6, coords[i + 1] / 1e6]);
+            if (i === 0) ctx.moveTo(pt.x, pt.y);
+            else ctx.lineTo(pt.x, pt.y);
+          }
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+    });
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[ch]));
+    }
+
+    function setupUiToggle() {
+      const button = document.getElementById("uiToggle");
+      button.addEventListener("click", () => {
+        const hidden = document.body.classList.toggle("ui-hidden");
+        button.textContent = hidden ? "显示 UI" : "隐藏 UI";
+        button.setAttribute("aria-pressed", String(hidden));
+      });
+    }
+
+    function buildRouteControls(routes, canvasRoutes) {
+      const container = document.getElementById("routeControls");
+      container.innerHTML = routes.map((route, index) => `
+        <label class="route-toggle">
+          <input type="checkbox" data-file="${escapeHtml(route.file)}" checked>
+          <span><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>
+        </label>
+      `).join("");
+      container.querySelectorAll("input[type='checkbox']").forEach(input => {
+        input.addEventListener("change", event => {
+          const file = event.target.dataset.file;
+          const visible = event.target.checked;
+          canvasRoutes.setVisible(file, visible);
+          const endpointLayer = routeEndpointLayers.get(file);
+          if (endpointLayer) {
+            if (visible) endpointLayer.addTo(startEndLayers);
+            else startEndLayers.removeLayer(endpointLayer);
+          }
+        });
+      });
+    }
+
+    setupUiToggle();
+
+    fetch("bus_route_map_data.json")
+      .then(response => response.json())
+      .then(data => {
+        const bounds = [];
+        const canvasRoutes = new CanvasRouteLayer(data.routes).addTo(routeLayers);
+        data.routes.forEach((route, index) => {
+          const color = colors[index % colors.length];
+          bounds.push([route.start.lat, route.start.lon], [route.end.lat, route.end.lon]);
+          const endpointLayer = L.layerGroup();
+          circle(route.start.lat, route.start.lon, "#0f766e", 8, `<strong>${escapeHtml(route.file)} 起点</strong><br>${escapeHtml(route.start.time)}<br>SOC：${escapeHtml(route.start.soc)}`).addTo(endpointLayer);
+          circle(route.end.lat, route.end.lon, "#991b1b", 8, `<strong>${escapeHtml(route.file)} 终点</strong><br>${escapeHtml(route.end.time)}<br>SOC：${escapeHtml(route.end.soc)}`).addTo(endpointLayer);
+          endpointLayer.addTo(startEndLayers);
+          routeEndpointLayers.set(route.file, endpointLayer);
+        });
+        buildRouteControls(data.routes, canvasRoutes);
+        if (data.summary.bbox) {
+          const [minLon, minLat, maxLon, maxLat] = data.summary.bbox;
+          bounds.push([minLat, minLon], [maxLat, maxLon]);
+        }
+
+        data.charging_locations.forEach(item => {
+          circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
+            `<strong>${escapeHtml(item.name)}</strong><br>记录数：${item.count.toLocaleString()}<br>状态：${escapeHtml(JSON.stringify(item.charge_states))}<br>${escapeHtml(item.first_time)} 至 ${escapeHtml(item.last_time)}`,
+            "#fde68a").addTo(chargingLayer);
+        });
+
+        data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {
+          circle(item.lat, item.lon, "#2563eb", 4,
+            `<strong>公交站点</strong><br>${escapeHtml(item.name || "未命名站点")}<br>距轨迹约 ${item.distance_m} m`,
+            "#93c5fd").addTo(stationLayer);
+        });
+        data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {
+          circle(item.lat, item.lon, "#dc2626", 3.8,
+            `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>距轨迹约 ${item.distance_m} m`,
+            "#fecaca").addTo(signalLayer);
+        });
+
+        if (bounds.length) {
+          map.fitBounds(bounds, { padding: [28, 28] });
+        }
+
+        document.getElementById("stats").innerHTML = `
+          <div class="stat"><strong>${data.routes.length}</strong>CSV 轨迹</div>
+          <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
+          <div class="stat"><strong>${data.charging_locations.length}</strong>充电位置</div>
+          <div class="stat"><strong>${data.osm_counts.bus_stop}</strong>站点 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
+        `;
+        document.getElementById("legend").innerHTML = `
+          <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
+          <div>路径使用全量数据；仅合并连续相同经纬度：${data.summary.total_compressed_points.toLocaleString()} 个绘制点，合并 ${data.summary.total_merged_repeats.toLocaleString()} 条重复记录</div>
+          <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
+          <div><span class="dot" style="background:#2563eb"></span>OSM 公交站点 <span class="dot" style="background:#dc2626;margin-left:12px"></span>OSM 红绿灯</div>
+        `;
+      });
+  </script>
+</body>
+</html>
