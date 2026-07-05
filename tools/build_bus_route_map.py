@@ -103,6 +103,13 @@ def parse_time(value):
         return None
 
 
+def date_from_time(value):
+    text = str(value or "").strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
 def valid_coord(lon, lat):
     return lon is not None and lat is not None and 119.0 < lon < 121.5 and 29.0 < lat < 31.5
 
@@ -175,6 +182,7 @@ def read_csv_points(path):
                 "lat": round(lat, 6),
                 "lon": round(lon, 6),
                 "time": str(row.get(TIME_FIELD, "")).strip(),
+                "date": date_from_time(row.get(TIME_FIELD, "")),
                 "speed": speed,
                 "charge": charge_state,
                 "soc": row.get(SOC_FIELD, ""),
@@ -199,6 +207,7 @@ def compress_consecutive_points(rows):
             "count": 1,
             "start_time": point["time"],
             "end_time": point["time"],
+            "date": point.get("date", ""),
         })
     return compressed
 
@@ -303,6 +312,7 @@ def cluster_points(points, radius_m, label_prefix):
                 "last_time": point["time"],
                 "charge_states": {},
                 "files": set(),
+                "dates_by_file": {},
             }
             clusters.append(chosen)
         chosen["count"] += 1
@@ -313,8 +323,15 @@ def cluster_points(points, radius_m, label_prefix):
         chosen["charge_states"][state] = chosen["charge_states"].get(state, 0) + 1
         if "file" in point:
             chosen["files"].add(point["file"])
+            point_date = point.get("date") or date_from_time(point.get("time", ""))
+            if point_date:
+                chosen["dates_by_file"].setdefault(point["file"], set()).add(point_date)
     for cluster in clusters:
         cluster["files"] = sorted(cluster["files"])
+        cluster["dates_by_file"] = {
+            file_name: sorted(dates)
+            for file_name, dates in sorted(cluster["dates_by_file"].items())
+        }
     clusters.sort(key=lambda c: c["count"], reverse=True)
     return clusters
 
@@ -554,6 +571,7 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
     max_distance = 0
     route_steps = []
     last_segment_id = None
+    last_step_date = None
 
     progress_step = 200_000
     for index, point in enumerate(points, start=1):
@@ -561,40 +579,48 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             print(f"Matching {file_name}: {index:,}/{len(points):,}", flush=True)
         segment, dist = nearest_road_segment((point["lat"], point["lon"]), road_grid, ref_lat, ROAD_MATCH_MAX_METERS)
         if segment:
+            point_date = point.get("date") or date_from_time(point["start_time"])
             finish_low_confidence_run(low_runs, current_low)
             current_low = None
             matched_points += 1
             matched_records += point["count"]
             max_distance = max(max_distance, dist)
-            if route_steps and segment["id"] == last_segment_id:
+            if route_steps and segment["id"] == last_segment_id and point_date == last_step_date:
                 route_steps[-1]["end_time"] = point["end_time"]
                 route_steps[-1]["points"] += 1
                 route_steps[-1]["raw_records"] += point["count"]
             else:
                 route_steps.append({
                     "segment_id": segment["id"],
+                    "date": point_date,
                     "start_time": point["start_time"],
                     "end_time": point["end_time"],
                     "points": 1,
                     "raw_records": point["count"],
                 })
                 last_segment_id = segment["id"]
+                last_step_date = point_date
             stats = matched_by_segment.setdefault(segment["id"], {
                 "count": 0,
                 "raw_records": 0,
                 "first_time": point["start_time"],
                 "last_time": point["end_time"],
                 "max_distance_m": 0,
+                "dates": set(),
             })
             stats["count"] += 1
             stats["raw_records"] += point["count"]
             stats["first_time"] = min(stats["first_time"], point["start_time"])
             stats["last_time"] = max(stats["last_time"], point["end_time"])
             stats["max_distance_m"] = max(stats["max_distance_m"], round(dist, 1))
+            if point_date:
+                stats["dates"].add(point_date)
             continue
 
         unmatched_points += 1
         unmatched_records += point["count"]
+        last_segment_id = None
+        last_step_date = None
         if current_low is None:
             current_low = {
                 "start_time": point["start_time"],
@@ -645,8 +671,10 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
             for index in range(1, len(route_steps)):
                 left = segments_by_id.get(route_steps[index - 1]["segment_id"])
                 right = segments_by_id.get(route_steps[index]["segment_id"])
+                same_date = route_steps[index - 1].get("date") == route_steps[index].get("date")
                 connected = (
-                    left
+                    same_date
+                    and left
                     and right
                     and segment_endpoint_distance_m(left, right) <= TEMPORAL_CONTINUITY_MAX_AERIAL_METERS
                 )
@@ -672,6 +700,13 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
         for index in range(1, len(route_steps) - 1):
             if not keep[index] or route_steps[index]["points"] > TEMPORAL_SPIKE_MAX_POINTS:
                 continue
+            same_date = (
+                route_steps[index - 1].get("date")
+                == route_steps[index].get("date")
+                == route_steps[index + 1].get("date")
+            )
+            if not same_date:
+                continue
             prev_segment = segments_by_id.get(route_steps[index - 1]["segment_id"])
             current_segment = segments_by_id.get(route_steps[index]["segment_id"])
             next_segment = segments_by_id.get(route_steps[index + 1]["segment_id"])
@@ -691,12 +726,19 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
 
         cleaned_steps = [step for index, step in enumerate(route_steps) if keep[index]]
         kept_segment_ids = {step["segment_id"] for step in cleaned_steps}
+        kept_dates_by_segment = {}
+        for step in cleaned_steps:
+            if step.get("date"):
+                kept_dates_by_segment.setdefault(step["segment_id"], set()).add(step["date"])
         before_segments = len(match["matched_by_segment"])
         match["matched_by_segment"] = {
             segment_id: stats
             for segment_id, stats in match["matched_by_segment"].items()
             if segment_id in kept_segment_ids
         }
+        for segment_id, stats in match["matched_by_segment"].items():
+            if "dates" in stats and kept_dates_by_segment.get(segment_id):
+                stats["dates"] &= kept_dates_by_segment[segment_id]
         match["route_steps"] = cleaned_steps
         removed_segments = before_segments - len(match["matched_by_segment"])
         match["summary"]["temporal_removed_steps"] = removed_steps
@@ -721,45 +763,51 @@ def fill_same_way_continuity(matches_by_file, way_segments):
     fill_summary = {}
     for file_name, match in matches_by_file.items():
         matched_by_segment = match["matched_by_segment"]
-        by_way = {}
-        for segment_id in matched_by_segment:
-            way_id_text, index_text = segment_id.split(":", 1)
-            by_way.setdefault(int(way_id_text), []).append(int(index_text))
-
         filled = 0
-        for way_id, matched_indexes in by_way.items():
-            segments = way_segments.get(way_id, [])
-            if not segments:
+        route_steps = match.get("route_steps", [])
+        for left_step, right_step in zip(route_steps, route_steps[1:]):
+            if left_step.get("date") != right_step.get("date"):
                 continue
-            if segments[0].get("highway") == "residential":
+            left_id = left_step["segment_id"]
+            right_id = right_step["segment_id"]
+            left_way_text, left_index_text = left_id.split(":", 1)
+            right_way_text, right_index_text = right_id.split(":", 1)
+            if left_way_text != right_way_text:
+                continue
+            way_id = int(left_way_text)
+            left = int(left_index_text)
+            right = int(right_index_text)
+            if right < left:
+                left, right = right, left
+            gap = right - left
+            if gap <= 1 or gap > WAY_GAP_FILL_MAX_SEGMENTS:
+                continue
+            segments = way_segments.get(way_id, [])
+            if not segments or segments[0].get("highway") == "residential":
                 continue
             segment_by_index = {segment["index"]: segment for segment in segments}
-            for left, right in zip(sorted(set(matched_indexes)), sorted(set(matched_indexes))[1:]):
-                gap = right - left
-                if gap <= 1 or gap > WAY_GAP_FILL_MAX_SEGMENTS:
-                    continue
-                missing = [segment_by_index.get(index) for index in range(left + 1, right)]
-                if not missing or any(segment is None for segment in missing):
-                    continue
-                missing_length = sum(segment["length_m"] for segment in missing)
-                if missing_length > WAY_GAP_FILL_MAX_METERS:
-                    continue
-                left_stats = matched_by_segment.get(f"{way_id}:{left}", {})
-                right_stats = matched_by_segment.get(f"{way_id}:{right}", {})
-                first_time = min(left_stats.get("first_time", ""), right_stats.get("first_time", ""))
-                last_time = max(left_stats.get("last_time", ""), right_stats.get("last_time", ""))
-                for segment in missing:
-                    stats = matched_by_segment.setdefault(segment["id"], {
-                        "count": 0,
-                        "raw_records": 0,
-                        "first_time": first_time,
-                        "last_time": last_time,
-                        "max_distance_m": 0,
-                        "continuity_fill": True,
-                    })
-                    if not stats.get("continuity_fill"):
-                        continue
-                    stats["continuity_fill"] = True
+            missing = [segment_by_index.get(index) for index in range(left + 1, right)]
+            if not missing or any(segment is None for segment in missing):
+                continue
+            missing_length = sum(segment["length_m"] for segment in missing)
+            if missing_length > WAY_GAP_FILL_MAX_METERS:
+                continue
+            fill_date = left_step.get("date", "")
+            for segment in missing:
+                is_new = segment["id"] not in matched_by_segment
+                stats = matched_by_segment.setdefault(segment["id"], {
+                    "count": 0,
+                    "raw_records": 0,
+                    "first_time": left_step["start_time"],
+                    "last_time": right_step["end_time"],
+                    "max_distance_m": 0,
+                    "dates": set(),
+                    "continuity_fill": True,
+                })
+                stats["continuity_fill"] = True
+                if fill_date:
+                    stats.setdefault("dates", set()).add(fill_date)
+                if is_new:
                     filled += 1
         match["summary"]["continuity_fill_segments"] = filled
         match["summary"]["drawn_segments"] = len(matched_by_segment)
@@ -779,6 +827,8 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
         skipped_far = 0
         failed = 0
         for left_step, right_step in zip(route_steps, route_steps[1:]):
+            if left_step.get("date") != right_step.get("date"):
+                continue
             left_id = left_step["segment_id"]
             right_id = right_step["segment_id"]
             if left_id == right_id:
@@ -814,10 +864,13 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
                     "first_time": left_step["start_time"],
                     "last_time": right_step["end_time"],
                     "max_distance_m": 0,
+                    "dates": set(),
                     "graph_connect": True,
                 })
                 if is_new:
                     added += 1
+                if left_step.get("date"):
+                    stats.setdefault("dates", set()).add(left_step["date"])
                 stats["graph_connect"] = True
         match["summary"]["graph_connect_segments"] = added
         match["summary"]["graph_connect_attempts"] = attempted
@@ -838,12 +891,13 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
     return connect_summary
 
 
-def build_route_vertex_index_from_segments(segment_ids, segments_by_id, ref_lat):
+def build_route_vertex_index_from_segments(matched_by_segment, segments_by_id, ref_lat):
     grid = {}
-    for segment_id in segment_ids:
+    for segment_id, stats in matched_by_segment.items():
         segment = segments_by_id.get(segment_id)
         if not segment:
             continue
+        dates = tuple(sorted(stats.get("dates") or []))
         points = [
             segment["path"][0],
             segment["path"][1],
@@ -855,7 +909,7 @@ def build_route_vertex_index_from_segments(segment_ids, segments_by_id, ref_lat)
         for lat, lon in points:
             x, y = project(lon, lat, ref_lat)
             key = (int(x // GRID_SIZE_METERS), int(y // GRID_SIZE_METERS))
-            grid.setdefault(key, []).append((x, y))
+            grid.setdefault(key, []).append((x, y, dates))
     return grid
 
 
@@ -864,14 +918,16 @@ def nearest_route_vertex_m(point, grid, ref_lat):
     ix = int(x // GRID_SIZE_METERS)
     iy = int(y // GRID_SIZE_METERS)
     best = float("inf")
+    best_dates = ()
     cells = int(math.ceil(ROUTE_SNAP_METERS / GRID_SIZE_METERS)) + 1
     for dx in range(-cells, cells + 1):
         for dy in range(-cells, cells + 1):
-            for rx, ry in grid.get((ix + dx, iy + dy), []):
+            for rx, ry, dates in grid.get((ix + dx, iy + dy), []):
                 dist = math.hypot(x - rx, y - ry)
                 if dist < best:
                     best = dist
-    return best
+                    best_dates = dates
+    return best, best_dates
 
 
 def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
@@ -884,15 +940,19 @@ def annotate_pois_by_routes(pois, route_grids_by_file, ref_lat):
         point = (poi["lat"], poi["lon"])
         files = []
         distances = {}
+        dates_by_file = {}
         for file_name, route_grid in route_grids_by_file.items():
-            dist = nearest_route_vertex_m(point, route_grid, ref_lat)
+            dist, dates = nearest_route_vertex_m(point, route_grid, ref_lat)
             if dist <= ROUTE_SNAP_METERS:
                 files.append(file_name)
                 distances[file_name] = round(dist, 1)
+                if dates:
+                    dates_by_file[file_name] = list(dates)
         if files:
             poi = dict(poi)
             poi["files"] = sorted(files)
             poi["route_distances_m"] = dict(sorted(distances.items()))
+            poi["dates_by_file"] = dict(sorted(dates_by_file.items()))
             poi["distance_m"] = min(distances.values())
             poi["stop_files"] = []
             poi["candidate_stop_files"] = []
@@ -983,6 +1043,7 @@ def attach_stop_evidence(osm_pois, stop_events, all_bus_stops, traffic_signals, 
                 "nearest_stop_event_m": stats["nearest_stop_event_m"],
                 "near_traffic_signal_events": stats["near_traffic_signal_events"],
                 "nearest_traffic_signal_m": stats["nearest_traffic_signal_m"],
+                "dates": sorted(stats["dates"]),
                 "status": status,
             }
         poi["stop_files"] = confirmed_files
@@ -1051,6 +1112,7 @@ def refine_low_confidence_with_osrm(file_name, runs):
             "files": [file_name],
             "match_counts_by_file": {file_name: run["raw_records"]},
             "matched_points_by_file": {file_name: run["points"]},
+            "dates_by_file": {file_name: [date_from_time(run["start_time"])] if date_from_time(run["start_time"]) else []},
             "source": "osrm",
             "refined_from": run["reason"],
             "confidence": result["confidence"],
@@ -1071,6 +1133,7 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
         counts = {}
         fill_files = []
         graph_files = []
+        dates_by_file = {}
         max_distance = 0
         for file_name, match in matches_by_file.items():
             stats = match["matched_by_segment"].get(segment_id)
@@ -1082,6 +1145,9 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
                 fill_files.append(file_name)
             if stats.get("graph_connect"):
                 graph_files.append(file_name)
+            date_values = stats.get("dates") or set()
+            if date_values:
+                dates_by_file[file_name] = sorted(date_values)
             max_distance = max(max_distance, stats["max_distance_m"])
         if not files:
             continue
@@ -1093,6 +1159,7 @@ def build_road_segments_output(segments_by_id, matches_by_file, osrm_segments):
             "length_m": segment["length_m"],
             "files": sorted(files),
             "match_counts_by_file": dict(sorted(counts.items())),
+            "dates_by_file": dict(sorted(dates_by_file.items())),
             "source": "local_osm",
             "continuity_fill_files": sorted(fill_files),
             "graph_connect_files": sorted(graph_files),
@@ -1149,6 +1216,27 @@ def build_html(data_json_name):
       display: grid;
       gap: 8px;
       font-size: 13px;
+    }}
+    .date-filter {{
+      padding: 10px 12px 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      font-size: 12px;
+    }}
+    .date-filter label {{
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }}
+    .date-filter select {{
+      width: 100%;
+      border: 1px solid #cfd6e3;
+      border-radius: 6px;
+      padding: 5px 6px;
+      background: white;
+      color: #152033;
+      font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
     .route-toggle {{
       display: grid;
@@ -1269,6 +1357,7 @@ def build_html(data_json_name):
   <button class="ui-toggle" id="uiToggle" type="button" aria-pressed="false">隐藏 UI</button>
   <aside class="route-panel">
     <header>CSV 轨迹</header>
+    <div class="date-filter" id="dateControls"></div>
     <div class="route-list" id="routeControls"></div>
   </aside>
   <aside class="panel">
@@ -1293,6 +1382,8 @@ def build_html(data_json_name):
     const routeEndpointLayers = new Map();
     const linkedMarkerRecords = [];
     let activeFiles = new Set();
+    let activeStartDate = "";
+    let activeEndDate = "";
     const overlays = {{
       "道路化行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
@@ -1321,10 +1412,17 @@ def build_html(data_json_name):
         }}));
         this.routeColor = new Map(routes.map((route, index) => [route.file, colors[index % colors.length]]));
         this.visibleFiles = new Set(routes.map(route => route.file));
+        this.startDate = "";
+        this.endDate = "";
       }},
       setVisible(file, visible) {{
         if (visible) this.visibleFiles.add(file);
         else this.visibleFiles.delete(file);
+        if (this.map) this.reset();
+      }},
+      setDateRange(startDate, endDate) {{
+        this.startDate = startDate || "";
+        this.endDate = endDate || "";
         if (this.map) this.reset();
       }},
       onAdd(mapInstance) {{
@@ -1342,7 +1440,9 @@ def build_html(data_json_name):
         this.canvas.remove();
       }},
       segmentActiveFiles(segment) {{
-        return (segment.files || []).filter(file => this.visibleFiles.has(file));
+        return (segment.files || []).filter(file =>
+          this.visibleFiles.has(file) && datesInRange((segment.dates_by_file || {{}})[file] || [], this.startDate, this.endDate)
+        );
       }},
       reset() {{
         const size = this.map.getSize();
@@ -1443,19 +1543,40 @@ def build_html(data_json_name):
       return (files || []).map(file => `<code>${{escapeHtml(file)}}</code>`).join("、") || "无";
     }}
 
+    function dateInRange(date, startDate = activeStartDate, endDate = activeEndDate) {{
+      if (!date) return !startDate && !endDate;
+      if (startDate && date < startDate) return false;
+      if (endDate && date > endDate) return false;
+      return true;
+    }}
+
+    function datesInRange(dates, startDate = activeStartDate, endDate = activeEndDate) {{
+      if (!startDate && !endDate) return true;
+      return (dates || []).some(date => dateInRange(date, startDate, endDate));
+    }}
+
+    function datesByFileInRange(datesByFile, files) {{
+      if (!activeStartDate && !activeEndDate) return true;
+      return (files || []).some(file => datesInRange((datesByFile || {{}})[file] || []));
+    }}
+
     function hasActiveFile(files) {{
       return (files || []).some(file => activeFiles.has(file));
     }}
 
-    function addLinkedMarker(group, marker, files) {{
-      const record = {{ group, marker, files: files || [] }};
+    function markerShouldShow(record) {{
+      return hasActiveFile(record.files) && datesByFileInRange(record.datesByFile, record.files);
+    }}
+
+    function addLinkedMarker(group, marker, files, datesByFile = null) {{
+      const record = {{ group, marker, files: files || [], datesByFile: datesByFile || {{}} }};
       linkedMarkerRecords.push(record);
-      if (hasActiveFile(record.files)) marker.addTo(group);
+      if (markerShouldShow(record)) marker.addTo(group);
     }}
 
     function refreshLinkedMarkers() {{
       linkedMarkerRecords.forEach(record => {{
-        const shouldShow = hasActiveFile(record.files);
+        const shouldShow = markerShouldShow(record);
         const isShown = record.group.hasLayer(record.marker);
         if (shouldShow && !isShown) record.marker.addTo(record.group);
         if (!shouldShow && isShown) record.group.removeLayer(record.marker);
@@ -1471,7 +1592,7 @@ def build_html(data_json_name):
       }});
     }}
 
-    function buildRouteControls(routes, canvasRoutes) {{
+    function buildRouteControls(routes, canvasRoutes, renderStats) {{
       const container = document.getElementById("routeControls");
       container.innerHTML = routes.map((route, index) => `
         <label class="route-toggle">
@@ -1492,8 +1613,45 @@ def build_html(data_json_name):
             else startEndLayers.removeLayer(endpointLayer);
           }}
           refreshLinkedMarkers();
+          renderStats();
         }});
       }});
+    }}
+
+    function buildDateControls(dates, canvasRoutes, renderStats) {{
+      const container = document.getElementById("dateControls");
+      const options = (dates || []).map(date => `<option value="${{escapeHtml(date)}}">${{escapeHtml(date)}}</option>`).join("");
+      container.innerHTML = `
+        <label>开始
+          <select id="startDateSelect">
+            <option value="">全部</option>
+            ${{options}}
+          </select>
+        </label>
+        <label>结束
+          <select id="endDateSelect">
+            <option value="">全部</option>
+            ${{options}}
+          </select>
+        </label>
+      `;
+      const startSelect = document.getElementById("startDateSelect");
+      const endSelect = document.getElementById("endDateSelect");
+      const apply = () => {{
+        let start = startSelect.value;
+        let end = endSelect.value;
+        if (start && end && start > end) {{
+          end = start;
+          endSelect.value = end;
+        }}
+        activeStartDate = start;
+        activeEndDate = end;
+        canvasRoutes.setDateRange(activeStartDate, activeEndDate);
+        refreshLinkedMarkers();
+        renderStats();
+      }};
+      startSelect.addEventListener("change", apply);
+      endSelect.addEventListener("change", apply);
     }}
 
     setupUiToggle();
@@ -1504,6 +1662,35 @@ def build_html(data_json_name):
         const bounds = [];
         activeFiles = new Set(data.routes.map(route => route.file));
         const canvasRoutes = new CanvasRouteLayer(data.road_segments || [], data.routes).addTo(routeLayers);
+        const segmentVisible = segment => (segment.files || []).some(file =>
+          activeFiles.has(file) && datesInRange((segment.dates_by_file || {{}})[file] || [])
+        );
+        const renderStats = () => {{
+          const visibleSegments = (data.road_segments || []).filter(segmentVisible).length;
+          const lowQuality = data.routes.filter(route => activeFiles.has(route.file) && route.road_match.refined_match_rate < 0.9);
+          const dateText = activeStartDate || activeEndDate
+            ? `${{activeStartDate || "最早"}} 至 ${{activeEndDate || "最晚"}}`
+            : "全部日期";
+          const matchRows = data.routes.filter(route => activeFiles.has(route.file)).map(route =>
+            `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，按时间剔除 ${{route.road_match.temporal_removed_segments || 0}} 段，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+          ).join("");
+          document.getElementById("stats").innerHTML = `
+            <div class="stat"><strong>${{activeFiles.size}}</strong>CSV 轨迹</div>
+            <div class="stat"><strong>${{data.summary.total_raw_points.toLocaleString()}}</strong>原始定位点</div>
+            <div class="stat"><strong>${{visibleSegments.toLocaleString()}}</strong>道路化片段</div>
+            <div class="stat"><strong>${{data.osm_counts.confirmed_stop_bus_stop || 0}}</strong>正式站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
+          `;
+          document.getElementById("legend").innerHTML = `
+            <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
+            <div>日期范围：${{escapeHtml(dateText)}}</div>
+            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接同日相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+            <div class="match-list">${{matchRows}}</div>
+            <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
+            <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+            <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${{data.summary.confirmed_stop_min_events}} 次、跨至少 ${{data.summary.confirmed_stop_min_days}} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
+            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${{lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}}</div>
+          `;
+        }};
         data.routes.forEach((route, index) => {{
           bounds.push([route.start.lat, route.start.lon], [route.end.lat, route.end.lon]);
           const endpointLayer = L.layerGroup();
@@ -1512,7 +1699,8 @@ def build_html(data_json_name):
           endpointLayer.addTo(startEndLayers);
           routeEndpointLayers.set(route.file, endpointLayer);
         }});
-        buildRouteControls(data.routes, canvasRoutes);
+        buildRouteControls(data.routes, canvasRoutes, renderStats);
+        buildDateControls(data.summary.available_dates || [], canvasRoutes, renderStats);
         if (data.summary.bbox) {{
           const [minLon, minLat, maxLon, maxLat] = data.summary.bbox;
           bounds.push([minLat, minLon], [maxLat, maxLon]);
@@ -1522,7 +1710,7 @@ def build_html(data_json_name):
           const marker = circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
             `<strong>充电位置</strong><br>${{escapeHtml(item.name)}}<br>关联 CSV：${{formatFiles(item.files)}}<br>记录数：${{item.count.toLocaleString()}}<br>状态：${{escapeHtml(JSON.stringify(item.charge_states))}}<br>${{escapeHtml(item.first_time)}} 至 ${{escapeHtml(item.last_time)}}`,
             "#fde68a");
-          addLinkedMarker(chargingLayer, marker, item.files);
+          addLinkedMarker(chargingLayer, marker, item.files, item.dates_by_file);
         }});
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {{
@@ -1535,38 +1723,21 @@ def build_html(data_json_name):
           const marker = circle(item.lat, item.lon, hasConfirmed ? "#1d4ed8" : (hasCandidate ? "#ca8a04" : "#64748b"), hasConfirmed ? 5.8 : (hasCandidate ? 4.8 : 3.4),
             `<strong>${{label}}</strong><br>${{escapeHtml(item.name || "未命名站点")}}<br>轨迹关联：${{formatFiles(item.files)}}<br>正式归属：${{formatFiles(item.stop_files)}}<br>候选归属：${{formatFiles(item.candidate_stop_files)}}${{statsHtml}}`,
             hasConfirmed ? "#60a5fa" : (hasCandidate ? "#fde047" : "#cbd5e1"));
-          addLinkedMarker(stationLayer, marker, item.files);
+          const stationDatesByFile = Object.fromEntries(Object.entries(item.stop_stats || {{}}).map(([file, stats]) => [file, stats.dates || []]));
+          addLinkedMarker(stationLayer, marker, item.files, stationDatesByFile);
         }});
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {{
           const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
             `<strong>红绿灯</strong><br>${{escapeHtml(item.name || "交通信号灯")}}<br>关联 CSV：${{formatFiles(item.files)}}<br>最近道路化轨迹距离：${{item.distance_m}} m`,
             "#fecaca");
-          addLinkedMarker(signalLayer, marker, item.files);
+          addLinkedMarker(signalLayer, marker, item.files, item.dates_by_file);
         }});
 
         if (bounds.length) {{
           map.fitBounds(bounds, {{ padding: [28, 28] }});
         }}
 
-        const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
-        const matchRows = data.routes.map(route =>
-          `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，按时间剔除 ${{route.road_match.temporal_removed_segments || 0}} 段，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
-        ).join("");
-        document.getElementById("stats").innerHTML = `
-          <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
-          <div class="stat"><strong>${{data.summary.total_raw_points.toLocaleString()}}</strong>原始定位点</div>
-          <div class="stat"><strong>${{data.road_segments.length.toLocaleString()}}</strong>道路化片段</div>
-          <div class="stat"><strong>${{data.osm_counts.confirmed_stop_bus_stop || 0}}</strong>正式站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
-        `;
-        document.getElementById("legend").innerHTML = `
-          <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
-          <div>主轨迹已道路化：按时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
-          <div class="match-list">${{matchRows}}</div>
-          <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
-          <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${{data.summary.confirmed_stop_min_events}} 次、跨至少 ${{data.summary.confirmed_stop_min_days}} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
-          <div>CSV 勾选会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${{lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}}</div>
-        `;
+        renderStats();
       }})
       .catch(error => {{
         console.error(error);
@@ -1587,6 +1758,7 @@ def main():
     total_compressed_points = 0
     total_merged_repeats = 0
     bbox = [999, 999, -999, -999]
+    available_dates = set()
 
     for path in sorted(DATA_DIR.glob("*.csv")):
         print(f"Reading {path.name}", flush=True)
@@ -1601,6 +1773,8 @@ def main():
         total_compressed_points += len(compressed)
         total_merged_repeats += len(rows) - len(compressed)
         stop_events.extend(extract_stop_events(rows, path.name))
+        file_dates = sorted({point.get("date", "") for point in rows if point.get("date")})
+        available_dates.update(file_dates)
         for p in rows:
             bbox[0] = min(bbox[0], p["lon"])
             bbox[1] = min(bbox[1], p["lat"])
@@ -1649,6 +1823,7 @@ def main():
             "merged_repeated_points": len(rows) - len(payload["compressed"]),
             "start": rows[0],
             "end": rows[-1],
+            "dates": sorted({point.get("date", "") for point in payload["compressed"] if point.get("date")}),
             "road_match": match["summary"],
             "osrm_refinement": osrm_summary,
         })
@@ -1696,6 +1871,7 @@ def main():
             "total_compressed_points": total_compressed_points,
             "total_merged_repeats": total_merged_repeats,
             "bbox": bbox,
+            "available_dates": sorted(available_dates),
             "poi_source": "OpenStreetMap Overpass API",
             "road_source": "OpenStreetMap Overpass API",
             "road_match_max_meters": ROAD_MATCH_MAX_METERS,

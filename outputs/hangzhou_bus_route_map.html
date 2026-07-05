@@ -44,6 +44,27 @@
       gap: 8px;
       font-size: 13px;
     }
+    .date-filter {
+      padding: 10px 12px 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .date-filter label {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .date-filter select {
+      width: 100%;
+      border: 1px solid #cfd6e3;
+      border-radius: 6px;
+      padding: 5px 6px;
+      background: white;
+      color: #152033;
+      font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
     .route-toggle {
       display: grid;
       grid-template-columns: 18px 1fr;
@@ -163,6 +184,7 @@
   <button class="ui-toggle" id="uiToggle" type="button" aria-pressed="false">隐藏 UI</button>
   <aside class="route-panel">
     <header>CSV 轨迹</header>
+    <div class="date-filter" id="dateControls"></div>
     <div class="route-list" id="routeControls"></div>
   </aside>
   <aside class="panel">
@@ -187,6 +209,8 @@
     const routeEndpointLayers = new Map();
     const linkedMarkerRecords = [];
     let activeFiles = new Set();
+    let activeStartDate = "";
+    let activeEndDate = "";
     const overlays = {
       "道路化行驶路径": routeLayers,
       "起点 / 终点": startEndLayers,
@@ -215,10 +239,17 @@
         }));
         this.routeColor = new Map(routes.map((route, index) => [route.file, colors[index % colors.length]]));
         this.visibleFiles = new Set(routes.map(route => route.file));
+        this.startDate = "";
+        this.endDate = "";
       },
       setVisible(file, visible) {
         if (visible) this.visibleFiles.add(file);
         else this.visibleFiles.delete(file);
+        if (this.map) this.reset();
+      },
+      setDateRange(startDate, endDate) {
+        this.startDate = startDate || "";
+        this.endDate = endDate || "";
         if (this.map) this.reset();
       },
       onAdd(mapInstance) {
@@ -236,7 +267,9 @@
         this.canvas.remove();
       },
       segmentActiveFiles(segment) {
-        return (segment.files || []).filter(file => this.visibleFiles.has(file));
+        return (segment.files || []).filter(file =>
+          this.visibleFiles.has(file) && datesInRange((segment.dates_by_file || {})[file] || [], this.startDate, this.endDate)
+        );
       },
       reset() {
         const size = this.map.getSize();
@@ -337,19 +370,40 @@
       return (files || []).map(file => `<code>${escapeHtml(file)}</code>`).join("、") || "无";
     }
 
+    function dateInRange(date, startDate = activeStartDate, endDate = activeEndDate) {
+      if (!date) return !startDate && !endDate;
+      if (startDate && date < startDate) return false;
+      if (endDate && date > endDate) return false;
+      return true;
+    }
+
+    function datesInRange(dates, startDate = activeStartDate, endDate = activeEndDate) {
+      if (!startDate && !endDate) return true;
+      return (dates || []).some(date => dateInRange(date, startDate, endDate));
+    }
+
+    function datesByFileInRange(datesByFile, files) {
+      if (!activeStartDate && !activeEndDate) return true;
+      return (files || []).some(file => datesInRange((datesByFile || {})[file] || []));
+    }
+
     function hasActiveFile(files) {
       return (files || []).some(file => activeFiles.has(file));
     }
 
-    function addLinkedMarker(group, marker, files) {
-      const record = { group, marker, files: files || [] };
+    function markerShouldShow(record) {
+      return hasActiveFile(record.files) && datesByFileInRange(record.datesByFile, record.files);
+    }
+
+    function addLinkedMarker(group, marker, files, datesByFile = null) {
+      const record = { group, marker, files: files || [], datesByFile: datesByFile || {} };
       linkedMarkerRecords.push(record);
-      if (hasActiveFile(record.files)) marker.addTo(group);
+      if (markerShouldShow(record)) marker.addTo(group);
     }
 
     function refreshLinkedMarkers() {
       linkedMarkerRecords.forEach(record => {
-        const shouldShow = hasActiveFile(record.files);
+        const shouldShow = markerShouldShow(record);
         const isShown = record.group.hasLayer(record.marker);
         if (shouldShow && !isShown) record.marker.addTo(record.group);
         if (!shouldShow && isShown) record.group.removeLayer(record.marker);
@@ -365,7 +419,7 @@
       });
     }
 
-    function buildRouteControls(routes, canvasRoutes) {
+    function buildRouteControls(routes, canvasRoutes, renderStats) {
       const container = document.getElementById("routeControls");
       container.innerHTML = routes.map((route, index) => `
         <label class="route-toggle">
@@ -386,8 +440,45 @@
             else startEndLayers.removeLayer(endpointLayer);
           }
           refreshLinkedMarkers();
+          renderStats();
         });
       });
+    }
+
+    function buildDateControls(dates, canvasRoutes, renderStats) {
+      const container = document.getElementById("dateControls");
+      const options = (dates || []).map(date => `<option value="${escapeHtml(date)}">${escapeHtml(date)}</option>`).join("");
+      container.innerHTML = `
+        <label>开始
+          <select id="startDateSelect">
+            <option value="">全部</option>
+            ${options}
+          </select>
+        </label>
+        <label>结束
+          <select id="endDateSelect">
+            <option value="">全部</option>
+            ${options}
+          </select>
+        </label>
+      `;
+      const startSelect = document.getElementById("startDateSelect");
+      const endSelect = document.getElementById("endDateSelect");
+      const apply = () => {
+        let start = startSelect.value;
+        let end = endSelect.value;
+        if (start && end && start > end) {
+          end = start;
+          endSelect.value = end;
+        }
+        activeStartDate = start;
+        activeEndDate = end;
+        canvasRoutes.setDateRange(activeStartDate, activeEndDate);
+        refreshLinkedMarkers();
+        renderStats();
+      };
+      startSelect.addEventListener("change", apply);
+      endSelect.addEventListener("change", apply);
     }
 
     setupUiToggle();
@@ -398,6 +489,35 @@
         const bounds = [];
         activeFiles = new Set(data.routes.map(route => route.file));
         const canvasRoutes = new CanvasRouteLayer(data.road_segments || [], data.routes).addTo(routeLayers);
+        const segmentVisible = segment => (segment.files || []).some(file =>
+          activeFiles.has(file) && datesInRange((segment.dates_by_file || {})[file] || [])
+        );
+        const renderStats = () => {
+          const visibleSegments = (data.road_segments || []).filter(segmentVisible).length;
+          const lowQuality = data.routes.filter(route => activeFiles.has(route.file) && route.road_match.refined_match_rate < 0.9);
+          const dateText = activeStartDate || activeEndDate
+            ? `${activeStartDate || "最早"} 至 ${activeEndDate || "最晚"}`
+            : "全部日期";
+          const matchRows = data.routes.filter(route => activeFiles.has(route.file)).map(route =>
+            `<div><code>${escapeHtml(route.file)}</code> 公交道路匹配 ${formatPercent(route.road_match.match_rate)}，按时间剔除 ${route.road_match.temporal_removed_segments || 0} 段，同路补齐 ${route.road_match.continuity_fill_segments || 0} 段，路网连接 ${route.road_match.graph_connect_segments || 0} 段，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
+          ).join("");
+          document.getElementById("stats").innerHTML = `
+            <div class="stat"><strong>${activeFiles.size}</strong>CSV 轨迹</div>
+            <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
+            <div class="stat"><strong>${visibleSegments.toLocaleString()}</strong>道路化片段</div>
+            <div class="stat"><strong>${data.osm_counts.confirmed_stop_bus_stop || 0}</strong>正式站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
+          `;
+          document.getElementById("legend").innerHTML = `
+            <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
+            <div>日期范围：${escapeHtml(dateText)}</div>
+            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接同日相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+            <div class="match-list">${matchRows}</div>
+            <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
+            <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
+            <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${data.summary.confirmed_stop_min_events} 次、跨至少 ${data.summary.confirmed_stop_min_days} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
+            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}</div>
+          `;
+        };
         data.routes.forEach((route, index) => {
           bounds.push([route.start.lat, route.start.lon], [route.end.lat, route.end.lon]);
           const endpointLayer = L.layerGroup();
@@ -406,7 +526,8 @@
           endpointLayer.addTo(startEndLayers);
           routeEndpointLayers.set(route.file, endpointLayer);
         });
-        buildRouteControls(data.routes, canvasRoutes);
+        buildRouteControls(data.routes, canvasRoutes, renderStats);
+        buildDateControls(data.summary.available_dates || [], canvasRoutes, renderStats);
         if (data.summary.bbox) {
           const [minLon, minLat, maxLon, maxLat] = data.summary.bbox;
           bounds.push([minLat, minLon], [maxLat, maxLon]);
@@ -416,7 +537,7 @@
           const marker = circle(item.lat, item.lon, "#f59e0b", Math.min(12, 5 + Math.log10(item.count + 1) * 2.8),
             `<strong>充电位置</strong><br>${escapeHtml(item.name)}<br>关联 CSV：${formatFiles(item.files)}<br>记录数：${item.count.toLocaleString()}<br>状态：${escapeHtml(JSON.stringify(item.charge_states))}<br>${escapeHtml(item.first_time)} 至 ${escapeHtml(item.last_time)}`,
             "#fde68a");
-          addLinkedMarker(chargingLayer, marker, item.files);
+          addLinkedMarker(chargingLayer, marker, item.files, item.dates_by_file);
         });
 
         data.osm_pois.filter(p => p.kind === "bus_stop").forEach(item => {
@@ -429,38 +550,21 @@
           const marker = circle(item.lat, item.lon, hasConfirmed ? "#1d4ed8" : (hasCandidate ? "#ca8a04" : "#64748b"), hasConfirmed ? 5.8 : (hasCandidate ? 4.8 : 3.4),
             `<strong>${label}</strong><br>${escapeHtml(item.name || "未命名站点")}<br>轨迹关联：${formatFiles(item.files)}<br>正式归属：${formatFiles(item.stop_files)}<br>候选归属：${formatFiles(item.candidate_stop_files)}${statsHtml}`,
             hasConfirmed ? "#60a5fa" : (hasCandidate ? "#fde047" : "#cbd5e1"));
-          addLinkedMarker(stationLayer, marker, item.files);
+          const stationDatesByFile = Object.fromEntries(Object.entries(item.stop_stats || {}).map(([file, stats]) => [file, stats.dates || []]));
+          addLinkedMarker(stationLayer, marker, item.files, stationDatesByFile);
         });
         data.osm_pois.filter(p => p.kind === "traffic_signal").forEach(item => {
           const marker = circle(item.lat, item.lon, "#dc2626", 3.8,
             `<strong>红绿灯</strong><br>${escapeHtml(item.name || "交通信号灯")}<br>关联 CSV：${formatFiles(item.files)}<br>最近道路化轨迹距离：${item.distance_m} m`,
             "#fecaca");
-          addLinkedMarker(signalLayer, marker, item.files);
+          addLinkedMarker(signalLayer, marker, item.files, item.dates_by_file);
         });
 
         if (bounds.length) {
           map.fitBounds(bounds, { padding: [28, 28] });
         }
 
-        const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
-        const matchRows = data.routes.map(route =>
-          `<div><code>${escapeHtml(route.file)}</code> 公交道路匹配 ${formatPercent(route.road_match.match_rate)}，按时间剔除 ${route.road_match.temporal_removed_segments || 0} 段，同路补齐 ${route.road_match.continuity_fill_segments || 0} 段，路网连接 ${route.road_match.graph_connect_segments || 0} 段，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
-        ).join("");
-        document.getElementById("stats").innerHTML = `
-          <div class="stat"><strong>${data.routes.length}</strong>CSV 轨迹</div>
-          <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
-          <div class="stat"><strong>${data.road_segments.length.toLocaleString()}</strong>道路化片段</div>
-          <div class="stat"><strong>${data.osm_counts.confirmed_stop_bus_stop || 0}</strong>正式站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
-        `;
-        document.getElementById("legend").innerHTML = `
-          <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
-          <div>主轨迹已道路化：按时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
-          <div class="match-list">${matchRows}</div>
-          <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
-          <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
-          <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${data.summary.confirmed_stop_min_events} 次、跨至少 ${data.summary.confirmed_stop_min_days} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
-          <div>CSV 勾选会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}</div>
-        `;
+        renderStats();
       })
       .catch(error => {
         console.error(error);
