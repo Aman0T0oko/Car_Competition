@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>路线与点位综合图</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .panel {
+      position: absolute;
+      right: 12px;
+      bottom: 20px;
+      z-index: 900;
+      width: min(390px, calc(100vw - 24px));
+      max-height: min(56vh, 520px);
+      overflow: auto;
+      background: rgba(255,255,255,.94);
+      border: 1px solid #d4dae5;
+      border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(31,41,55,.18);
+      padding: 12px 14px;
+      color: #172033;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .panel strong { display: block; font-size: 15px; margin-bottom: 7px; }
+    .row { display: flex; justify-content: space-between; gap: 14px; }
+    .section { margin-top: 10px; padding-top: 8px; border-top: 1px solid #e3e8f0; }
+    .filters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0 10px; }
+    .field { display: grid; gap: 3px; }
+    .field label { font-size: 12px; color: #526071; }
+    select {
+      width: 100%;
+      min-height: 32px;
+      border: 1px solid #cfd6e3;
+      border-radius: 6px;
+      background: #fff;
+      color: #172033;
+      font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 4px 7px;
+    }
+    .ui-toggle {
+      position: absolute;
+      left: 12px;
+      bottom: 20px;
+      z-index: 1100;
+      min-width: 76px;
+      min-height: 34px;
+      border: 1px solid #cfd6e3;
+      border-radius: 8px;
+      background: rgba(255,255,255,.96);
+      box-shadow: 0 8px 22px rgba(31,41,55,.16);
+      color: #152033;
+      cursor: pointer;
+      font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body.ui-hidden .panel,
+    body.ui-hidden .leaflet-control-layers { display: none; }
+    .leaflet-popup-content { font-size: 13px; line-height: 1.45; }
+    @media (max-width: 680px) {
+      .panel { left: 10px; right: 10px; bottom: 62px; width: auto; max-height: 42vh; }
+      .ui-toggle { left: 10px; bottom: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <button class="ui-toggle" id="uiToggle" type="button" aria-pressed="false">隐藏 UI</button>
+  <aside class="panel">
+    <strong>路线与点位综合图</strong>
+    <div class="filters">
+      <div class="field">
+        <label for="startDateSelect">开始日期</label>
+        <select id="startDateSelect"></select>
+      </div>
+      <div class="field">
+        <label for="endDateSelect">结束日期</label>
+        <select id="endDateSelect"></select>
+      </div>
+    </div>
+    <div class="row"><span>A/B 可用路线</span><span id="acceptedCount">0</span></div>
+    <div class="row"><span>C/D 复核片段</span><span id="reviewCount">0</span></div>
+    <div id="routeBreakdown"></div>
+    <div class="section" id="poiStats"></div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map("map", { preferCanvas: true });
+    const base = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+    const routeColors = {
+      "01.csv": "#2563eb",
+      "02.csv": "#16a34a",
+      "03.csv": "#dc2626",
+      "04.csv": "#7c3aed",
+      "05.csv": "#ea580c"
+    };
+    const poiStyles = {
+      start: ["#0f766e", 8, "起点"],
+      end: ["#991b1b", 8, "终点"],
+      charging_location: ["#f59e0b", 7, "充电位置"],
+      bus_stop: ["#2563eb", 5, "站点"],
+      traffic_signal: ["#dc2626", 4, "红绿灯"]
+    };
+    const overlays = {};
+    const visibleLayers = [];
+    const routeAcceptedLayers = {};
+    const routeReviewLayers = {};
+    const poiLayers = {};
+    let allAcceptedLines = [];
+    let allReviewLines = [];
+    let allPoiFeatures = [];
+
+    document.getElementById("uiToggle").addEventListener("click", event => {
+      const hidden = document.body.classList.toggle("ui-hidden");
+      event.currentTarget.textContent = hidden ? "显示 UI" : "隐藏 UI";
+      event.currentTarget.setAttribute("aria-pressed", String(hidden));
+    });
+
+    function colorFor(file) {
+      return routeColors[file] || "#334155";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[ch]));
+    }
+
+    function routePopup(feature, layer) {
+      const p = feature.properties || {};
+      layer.bindPopup(`
+        <strong>${escapeHtml(p.file)} · ${escapeHtml(p.job_id)}</strong><br>
+        等级：${escapeHtml(p.grade)}，分数：${escapeHtml(p.score)}<br>
+        状态：${escapeHtml(p.status)}<br>
+        原因：${escapeHtml(p.reasons || "无")}<br>
+        时间：${escapeHtml(p.start_time)} 至 ${escapeHtml(p.end_time)}<br>
+        里程：${escapeHtml(p.corrected_distance_m || p.raw_distance_m || "")} m
+      `);
+    }
+
+    function poiPopup(props) {
+      return `<strong>${escapeHtml(props.name || props.kind)}</strong><br>` +
+        Object.entries(props)
+          .filter(([key]) => !["name"].includes(key))
+          .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(value)}`)
+          .join("<br>");
+    }
+
+    function addOverlay(name, layer, visible = true) {
+      overlays[name] = layer;
+      if (visible) layer.addTo(map);
+      visibleLayers.push(layer);
+    }
+
+    function dateOnly(value) {
+      const text = String(value || "");
+      return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : "";
+    }
+
+    function featureDateRange(feature) {
+      const p = feature.properties || {};
+      const start = dateOnly(p.start_time || p.time || p.first_time);
+      const end = dateOnly(p.end_time || p.time || p.last_time || p.start_time || p.first_time);
+      return [start, end || start];
+    }
+
+    function dayList(start, end) {
+      const days = [];
+      const [sy, sm, sd] = start.split("-").map(Number);
+      const [ey, em, ed] = end.split("-").map(Number);
+      const current = new Date(Date.UTC(sy, sm - 1, sd));
+      const last = new Date(Date.UTC(ey, em - 1, ed));
+      while (current <= last) {
+        days.push(current.toISOString().slice(0, 10));
+        current.setUTCDate(current.getUTCDate() + 1);
+      }
+      return days;
+    }
+
+    function inDateRange(feature, startDate, endDate) {
+      const [start, end] = featureDateRange(feature);
+      if (!start && !end) return true;
+      return (end || start) >= startDate && (start || end) <= endDate;
+    }
+
+    function populateDateControls(features) {
+      const dates = [];
+      features.forEach(feature => {
+        const [start, end] = featureDateRange(feature);
+        if (start) dates.push(start);
+        if (end) dates.push(end);
+      });
+      dates.sort();
+      const minDate = dates[0];
+      const maxDate = dates[dates.length - 1];
+      const days = minDate && maxDate ? dayList(minDate, maxDate) : [];
+      const startSelect = document.getElementById("startDateSelect");
+      const endSelect = document.getElementById("endDateSelect");
+      startSelect.innerHTML = days.map(day => `<option value="${day}">${day}</option>`).join("");
+      endSelect.innerHTML = days.map(day => `<option value="${day}">${day}</option>`).join("");
+      if (days.length) {
+        startSelect.value = days[0];
+        endSelect.value = days[days.length - 1];
+      }
+      const onChange = () => {
+        if (startSelect.value > endSelect.value) endSelect.value = startSelect.value;
+        renderFiltered();
+      };
+      startSelect.addEventListener("change", onChange);
+      endSelect.addEventListener("change", onChange);
+    }
+
+    function addRouteFeature(layer, feature, color, opacity) {
+      L.geoJSON(feature, {
+        style: () => ({ color, weight: 2, opacity }),
+        onEachFeature: routePopup
+      }).eachLayer(item => layer.addLayer(item));
+    }
+
+    function addPoiFeature(layer, feature, color, radius) {
+      const props = feature.properties || {};
+      const [lon, lat] = feature.geometry.coordinates;
+      L.circleMarker([lat, lon], {
+        radius,
+        color,
+        weight: 2,
+        fillColor: color,
+        fillOpacity: props.kind === "traffic_signal" ? 0.65 : 0.86
+      }).bindPopup(poiPopup(props)).addTo(layer);
+    }
+
+    function renderFiltered() {
+      const startDate = document.getElementById("startDateSelect").value;
+      const endDate = document.getElementById("endDateSelect").value;
+      const files = Array.from(new Set(
+        allAcceptedLines.concat(allReviewLines).map(f => f.properties.file)
+      )).sort();
+      const routeBreakdown = [];
+      let acceptedCount = 0;
+      let reviewCount = 0;
+
+      Object.values(routeAcceptedLayers).forEach(layer => layer.clearLayers());
+      Object.values(routeReviewLayers).forEach(layer => layer.clearLayers());
+      Object.values(poiLayers).forEach(layer => layer.clearLayers());
+
+      files.forEach(file => {
+        const color = colorFor(file);
+        const acceptedForFile = allAcceptedLines.filter(feature => feature.properties.file === file);
+        const reviewForFile = allReviewLines.filter(feature => feature.properties.file === file);
+        const acceptedFiltered = acceptedForFile.filter(feature => inDateRange(feature, startDate, endDate));
+        const reviewFiltered = reviewForFile.filter(feature => inDateRange(feature, startDate, endDate));
+        acceptedFiltered.forEach(feature => addRouteFeature(routeAcceptedLayers[file], feature, color, 0.9));
+        reviewFiltered.forEach(feature => addRouteFeature(routeReviewLayers[file], feature, color, 0.42));
+        acceptedCount += acceptedFiltered.length;
+        reviewCount += reviewFiltered.length;
+        routeBreakdown.push(`<div class="row"><span><span style="display:inline-block;width:22px;height:4px;border-radius:3px;background:${color};vertical-align:2px;margin-right:7px"></span>${file}</span><span>${acceptedFiltered.length}/${reviewFiltered.length}</span></div>`);
+      });
+
+      const poiCounts = {};
+      allPoiFeatures.forEach(feature => {
+        const props = feature.properties || {};
+        const kind = props.kind;
+        if (kind !== "traffic_signal" && !inDateRange(feature, startDate, endDate)) return;
+        const [color, radius, label] = poiStyles[kind] || ["#334155", 5, "其他点位"];
+        poiCounts[kind] = (poiCounts[kind] || 0) + 1;
+        addPoiFeature(poiLayers[label], feature, color, radius);
+      });
+
+      document.getElementById("acceptedCount").textContent = acceptedCount.toLocaleString();
+      document.getElementById("reviewCount").textContent = reviewCount.toLocaleString();
+      document.getElementById("routeBreakdown").innerHTML = routeBreakdown.join("");
+      document.getElementById("poiStats").innerHTML = Object.entries(poiStyles).map(([kind, [, , label]]) =>
+        `<div class="row"><span>${label}</span><span>${(poiCounts[kind] || 0).toLocaleString()}</span></div>`
+      ).join("");
+    }
+
+    function featureBounds(features) {
+      const bounds = L.latLngBounds([]);
+      features.forEach(feature => {
+        const geometry = feature.geometry || {};
+        if (geometry.type === "Point") {
+          const [lon, lat] = geometry.coordinates;
+          bounds.extend([lat, lon]);
+        }
+        if (geometry.type === "LineString") {
+          geometry.coordinates.forEach(([lon, lat]) => bounds.extend([lat, lon]));
+        }
+      });
+      return bounds;
+    }
+
+    Promise.all([
+      fetch("corrected_routes.geojson").then(r => r.json()),
+      fetch("review_segments.geojson").then(r => r.json()),
+      fetch("poi_analysis.geojson").then(r => r.json())
+    ]).then(([accepted, review, pois]) => {
+      allAcceptedLines = accepted.features.filter(f => f.geometry.type === "LineString");
+      allReviewLines = review.features.filter(f => f.geometry.type === "LineString");
+      allPoiFeatures = pois.features.filter(f => f.geometry.type === "Point");
+      const files = Array.from(new Set(
+        allAcceptedLines.concat(allReviewLines).map(f => f.properties.file)
+      )).sort();
+
+      files.forEach(file => {
+        routeAcceptedLayers[file] = L.layerGroup();
+        routeReviewLayers[file] = L.layerGroup();
+        addOverlay(`${file} A/B 可用`, routeAcceptedLayers[file], true);
+        addOverlay(`${file} C/D 复核`, routeReviewLayers[file], true);
+      });
+
+      Object.entries(poiStyles).forEach(([kind, [, , label]]) => {
+        poiLayers[label] = L.layerGroup();
+        addOverlay(label, poiLayers[label], true);
+      });
+
+      L.control.layers({"OpenStreetMap": base}, overlays, { collapsed: false }).addTo(map);
+      populateDateControls(allAcceptedLines.concat(allReviewLines, allPoiFeatures));
+      renderFiltered();
+      const bounds = featureBounds(allAcceptedLines.concat(allReviewLines, allPoiFeatures));
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [24, 24] });
+      else map.setView([30.27, 120.18], 12);
+    });
+  </script>
+</body>
+</html>

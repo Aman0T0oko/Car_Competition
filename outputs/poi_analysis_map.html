@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>公交点位分析</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .panel {
+      position: absolute;
+      right: 12px;
+      bottom: 20px;
+      z-index: 900;
+      width: min(380px, calc(100vw - 24px));
+      background: rgba(255,255,255,.94);
+      border: 1px solid #d4dae5;
+      border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(31,41,55,.18);
+      padding: 12px 14px;
+      color: #172033;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .panel strong { display: block; font-size: 15px; margin-bottom: 7px; }
+    .row { display: flex; justify-content: space-between; gap: 14px; }
+    .leaflet-popup-content { font-size: 13px; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <aside class="panel">
+    <strong>公交点位分析</strong>
+    <div id="stats"></div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map("map", { preferCanvas: true });
+    const base = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+    const styles = {
+      start: ["#0f766e", 8],
+      end: ["#991b1b", 8],
+      charging_location: ["#f59e0b", 7],
+      bus_stop: ["#2563eb", 5],
+      traffic_signal: ["#dc2626", 4]
+    };
+    const labels = {
+      start: "起点",
+      end: "终点",
+      charging_location: "充电位置",
+      bus_stop: "站点",
+      traffic_signal: "红绿灯"
+    };
+    const layers = {};
+    Object.keys(labels).forEach(kind => {
+      layers[labels[kind]] = L.layerGroup().addTo(map);
+    });
+    L.control.layers({"OpenStreetMap": base}, layers, { collapsed: false }).addTo(map);
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[ch]));
+    }
+
+    function popup(props) {
+      return `<strong>${escapeHtml(props.name || props.kind)}</strong><br>` +
+        Object.entries(props)
+          .filter(([key]) => !["name"].includes(key))
+          .map(([key, value]) => `${escapeHtml(key)}：${escapeHtml(value)}`)
+          .join("<br>");
+    }
+
+    fetch("poi_analysis.geojson").then(r => r.json()).then(data => {
+      const counts = {};
+      const bounds = [];
+      data.features.forEach(feature => {
+        const props = feature.properties || {};
+        const kind = props.kind;
+        const [color, radius] = styles[kind] || ["#334155", 5];
+        const [lon, lat] = feature.geometry.coordinates;
+        counts[kind] = (counts[kind] || 0) + 1;
+        bounds.push([lat, lon]);
+        const marker = L.circleMarker([lat, lon], {
+          radius,
+          color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: kind === "traffic_signal" ? 0.65 : 0.85
+        }).bindPopup(popup(props));
+        marker.addTo(layers[labels[kind]] || layers["站点"]);
+      });
+      document.getElementById("stats").innerHTML = Object.keys(labels).map(kind =>
+        `<div class="row"><span>${labels[kind]}</span><span>${(counts[kind] || 0).toLocaleString()}</span></div>`
+      ).join("");
+      if (bounds.length) map.fitBounds(bounds, { padding: [24, 24] });
+      else map.setView([30.27, 120.18], 12);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "inputs": {
+    "csv_files": [
+      "01.csv",
+      "02.csv",
+      "03.csv",
+      "04.csv",
+      "05.csv"
+    ],
+    "osm_poi_file": "outputs/hangzhou_osm_poi.json",
+    "route_point_source": "outputs/production/correction_jobs"
+  },
+  "counts": {
+    "endpoints": 10,
+    "charging_locations": 33,
+    "stop_events": 112435,
+    "matched_stop_events": 49280,
+    "unmatched_stop_events": 63155,
+    "stations_total": 303,
+    "stations_confirmed": 209,
+    "stations_candidate": 94,
+    "traffic_signals": 187
+  },
+  "thresholds": {
+    "stop_speed_kmh": 1.0,
+    "stop_min_seconds": 20,
+    "stop_max_seconds": 900,
+    "charge_cluster_meters": 160,
+    "stop_to_bus_stop_meters": 55,
+    "route_to_signal_meters": 70,
+    "confirmed_stop_min_events": 3,
+    "confirmed_stop_min_days": 2
+  },
+  "outputs": {
+    "geojson": "outputs/poi_analysis.geojson",
+    "csv": "outputs/poi_analysis_report.csv",
+    "html": "outputs/poi_analysis_map.html",
+    "combined_html": "outputs/route_poi_dashboard.html"
+  }
+}
