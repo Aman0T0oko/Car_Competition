@@ -286,28 +286,41 @@
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
 
-        const drawSegment = (segment, strokeStyle, lineWidth, alpha) => {
+        const drawSegment = (segment, strokeStyle, lineWidth, alpha, offset = 0) => {
           const pts = segment.path.map(([lat, lon]) => this.map.latLngToContainerPoint([lat, lon]));
           segment.projected = pts;
           if (pts.length < 2) return;
+          const first = pts[0];
+          const last = pts[pts.length - 1];
+          const dx = last.x - first.x;
+          const dy = last.y - first.y;
+          const len = Math.hypot(dx, dy) || 1;
+          const ox = -dy / len * offset;
+          const oy = dx / len * offset;
           ctx.beginPath();
           ctx.strokeStyle = strokeStyle;
           ctx.lineWidth = lineWidth;
           ctx.globalAlpha = alpha;
-          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x + ox, pt.y + oy) : ctx.lineTo(pt.x + ox, pt.y + oy));
           ctx.stroke();
         };
 
         const activeSegments = this.segments
           .map(segment => [segment, this.segmentActiveFiles(segment)])
           .filter(([, files]) => files.length);
-        for (const [segment] of activeSegments) {
-          drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 8 : 6.4, 0.82);
+        for (const [segment, files] of activeSegments) {
+          files.forEach((file, index) => {
+            const offset = (index - (files.length - 1) / 2) * 5;
+            drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 7.8 : 5.8, 0.82, offset);
+          });
         }
         for (const [segment, files] of activeSegments) {
-          const color = files.includes("01.csv") ? this.routeColor.get("01.csv") : this.routeColor.get(files[0]);
-          const width = segment.source === "osrm" ? 4.8 : (files.includes("01.csv") ? 4.4 : 3.4);
-          drawSegment(segment, color || "#2563eb", width, segment.source === "osrm" ? 0.96 : 0.86);
+          files.forEach((file, index) => {
+            const offset = (index - (files.length - 1) / 2) * 5;
+            const color = this.routeColor.get(file) || "#2563eb";
+            const width = segment.source === "osrm" ? 4.6 : 3.2;
+            drawSegment(segment, color, width, segment.source === "osrm" ? 0.96 : 0.86, offset);
+          });
         }
         ctx.globalAlpha = 1;
       },
@@ -326,7 +339,14 @@
         const segment = best.segment;
         const counts = Object.entries(segment.match_counts_by_file || {})
           .filter(([file]) => best.files.includes(file))
-          .map(([file, count]) => `<code>${escapeHtml(file)}</code>：${Number(count || 0).toLocaleString()} 条`)
+          .map(([file, count]) => {
+            const dateCount = datesForFileInRange(segment.dates_by_file, file).length;
+            const flags = [
+              (segment.graph_connect_files || []).includes(file) ? "可信路网连接" : "",
+              (segment.continuity_fill_files || []).includes(file) ? "同路补齐" : ""
+            ].filter(Boolean).join("，");
+            return `<code>${escapeHtml(file)}</code>：${Number(count || 0).toLocaleString()} 条，${dateCount} 天${flags ? `，${flags}` : ""}`;
+          })
           .join("<br>");
         L.popup()
           .setLatLng(event.latlng)
@@ -385,6 +405,34 @@
     function datesByFileInRange(datesByFile, files) {
       if (!activeStartDate && !activeEndDate) return true;
       return (files || []).some(file => datesInRange((datesByFile || {})[file] || []));
+    }
+
+    function datesForFileInRange(datesByFile, file, startDate = activeStartDate, endDate = activeEndDate) {
+      return ((datesByFile || {})[file] || []).filter(date => dateInRange(date, startDate, endDate));
+    }
+
+    function aggregateDateStats(route, startDate = activeStartDate, endDate = activeEndDate) {
+      const byDate = route.road_match.by_date || {};
+      const total = {
+        total_points: 0,
+        matched_points: 0,
+        low_confidence_segments: 0,
+        temporal_removed_segments: 0,
+        continuity_fill_segments: 0,
+        graph_connect_segments: 0,
+        graph_connect_attempts: 0,
+        graph_connect_failed: 0,
+        graph_connect_skipped_far: 0,
+        graph_connect_skipped_untrusted: 0
+      };
+      Object.entries(byDate).forEach(([date, stats]) => {
+        if (!dateInRange(date, startDate, endDate)) return;
+        Object.keys(total).forEach(key => {
+          total[key] += Number(stats[key] || 0);
+        });
+      });
+      total.match_rate = total.total_points ? total.matched_points / total.total_points : 0;
+      return total;
     }
 
     function hasActiveFile(files) {
@@ -494,28 +542,42 @@
         );
         const renderStats = () => {
           const visibleSegments = (data.road_segments || []).filter(segmentVisible).length;
-          const lowQuality = data.routes.filter(route => activeFiles.has(route.file) && route.road_match.refined_match_rate < 0.9);
+          const activeRoutes = data.routes.filter(route => activeFiles.has(route.file));
+          const rangeStatsByFile = new Map(activeRoutes.map(route => [route.file, aggregateDateStats(route)]));
+          const selectedPoints = Array.from(rangeStatsByFile.values()).reduce((sum, stats) => sum + stats.total_points, 0);
+          const selectedMatched = Array.from(rangeStatsByFile.values()).reduce((sum, stats) => sum + stats.matched_points, 0);
+          const selectedRate = selectedPoints ? selectedMatched / selectedPoints : 0;
+          const lowQuality = activeRoutes.filter(route => {
+            const stats = rangeStatsByFile.get(route.file);
+            return stats && stats.total_points > 0 && stats.match_rate < 0.9;
+          });
           const dateText = activeStartDate || activeEndDate
             ? `${activeStartDate || "最早"} 至 ${activeEndDate || "最晚"}`
             : "全部日期";
-          const matchRows = data.routes.filter(route => activeFiles.has(route.file)).map(route =>
-            `<div><code>${escapeHtml(route.file)}</code> 公交道路匹配 ${formatPercent(route.road_match.match_rate)}，按时间剔除 ${route.road_match.temporal_removed_segments || 0} 段，同路补齐 ${route.road_match.continuity_fill_segments || 0} 段，路网连接 ${route.road_match.graph_connect_segments || 0} 段，低置信 ${route.road_match.low_confidence_segments} 段${route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`
+          const matchRows = activeRoutes.map(route => {
+            const stats = rangeStatsByFile.get(route.file) || aggregateDateStats(route);
+            if (!stats.total_points) {
+              return `<div><code>${escapeHtml(route.file)}</code> 当前范围无数据；全量匹配 ${formatPercent(route.road_match.match_rate)}</div>`;
+            }
+            return `<div><code>${escapeHtml(route.file)}</code> 当前范围匹配 ${formatPercent(stats.match_rate)}（${Number(stats.matched_points || 0).toLocaleString()}/${Number(stats.total_points || 0).toLocaleString()} 点），全量 ${formatPercent(route.road_match.match_rate)}；剔除 ${stats.temporal_removed_segments || 0} 段，同路补齐 ${stats.continuity_fill_segments || 0} 段，可信路网连接 ${stats.graph_connect_segments || 0} 段，低置信 ${stats.low_confidence_segments || 0} 段，不可信跳过 ${stats.graph_connect_skipped_untrusted || 0} 次${stats.match_rate < 0.9 ? "，需要人工/API 精修" : ""}</div>`;
+          }
           ).join("");
           document.getElementById("stats").innerHTML = `
             <div class="stat"><strong>${activeFiles.size}</strong>CSV 轨迹</div>
-            <div class="stat"><strong>${data.summary.total_raw_points.toLocaleString()}</strong>原始定位点</div>
+            <div class="stat"><strong>${selectedPoints.toLocaleString()}</strong>当前压缩点</div>
+            <div class="stat"><strong>${formatPercent(selectedRate)}</strong>当前匹配率</div>
             <div class="stat"><strong>${visibleSegments.toLocaleString()}</strong>道路化片段</div>
             <div class="stat"><strong>${data.osm_counts.confirmed_stop_bus_stop || 0}</strong>正式站 / <strong style="display:inline">${data.osm_counts.traffic_signal}</strong>灯</div>
           `;
           document.getElementById("legend").innerHTML = `
             <div>${data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${colors[index % colors.length]}"></span>${escapeHtml(route.file)}</span>`).join("")}</div>
             <div>日期范围：${escapeHtml(dateText)}</div>
-            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接同日相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路；只用同日、时间连续、速度和绕行比例可信的 OSM 路网连接补齐缺口。</div>
             <div class="match-list">${matchRows}</div>
             <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
             <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
             <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${data.summary.confirmed_stop_min_events} 次、跨至少 ${data.summary.confirmed_stop_min_days} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
-            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}</div>
+            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${lowQuality.length ? " 当前日期范围内有线路低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}</div>
           `;
         };
         data.routes.forEach((route, index) => {

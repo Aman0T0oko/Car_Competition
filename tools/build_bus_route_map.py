@@ -35,6 +35,9 @@ ROAD_MATCH_MAX_METERS = 35
 ROAD_CONNECT_MAX_AERIAL_METERS = 450
 ROAD_CONNECT_MAX_PATH_METERS = 1200
 ROAD_CONNECT_MAX_SEARCH_NODES = 3500
+TRUSTED_CONNECT_MAX_SECONDS = 10 * 60
+TRUSTED_CONNECT_MAX_SPEED_KMH = 70
+TRUSTED_CONNECT_MAX_PATH_RATIO = 3.5
 WAY_GAP_FILL_MAX_SEGMENTS = 80
 WAY_GAP_FILL_MAX_METERS = 2500
 RESIDENTIAL_MATCH_MAX_METERS = 18
@@ -108,6 +111,14 @@ def date_from_time(value):
     if len(text) >= 10 and text[4] == "-" and text[7] == "-":
         return text[:10]
     return ""
+
+
+def seconds_between(left, right):
+    left_time = parse_time(left)
+    right_time = parse_time(right)
+    if not left_time or not right_time:
+        return None
+    return (right_time - left_time).total_seconds()
 
 
 def valid_coord(lon, lat):
@@ -536,10 +547,37 @@ def shortest_path_between_segments(start_segment, end_segment, graph):
     return segment_ids
 
 
+def route_path_length_m(path_ids, segments_by_id):
+    return sum(segments_by_id[segment_id]["length_m"] for segment_id in path_ids if segment_id in segments_by_id)
+
+
+def trusted_graph_connection(left_step, right_step, aerial_m, path_length_m):
+    if path_length_m <= 0:
+        return False, "empty_path"
+    if aerial_m > ROAD_CONNECT_MAX_AERIAL_METERS:
+        return False, "too_far"
+    ratio = path_length_m / max(aerial_m, 60)
+    if ratio > TRUSTED_CONNECT_MAX_PATH_RATIO:
+        return False, "detour"
+    gap_seconds = seconds_between(left_step.get("end_time"), right_step.get("start_time"))
+    if gap_seconds is None:
+        return False, "missing_time"
+    if gap_seconds < 0:
+        return False, "time_reversed"
+    if gap_seconds > TRUSTED_CONNECT_MAX_SECONDS:
+        return False, "time_gap"
+    min_seconds = max(gap_seconds, 10)
+    speed_kmh = path_length_m / min_seconds * 3.6
+    if speed_kmh > TRUSTED_CONNECT_MAX_SPEED_KMH:
+        return False, "speed"
+    return True, "trusted"
+
+
 def finish_low_confidence_run(runs, current):
     if not current or current["points"] < LOW_CONFIDENCE_MIN_POINTS:
         return
     run = {
+        "date": current.get("date", ""),
         "start_time": current["start_time"],
         "end_time": current["end_time"],
         "points": current["points"],
@@ -560,10 +598,43 @@ def add_osrm_sample(current, point):
         sample[-1] = [point["lon"], point["lat"]]
 
 
+def empty_date_match_stats():
+    return {
+        "total_points": 0,
+        "total_raw_records": 0,
+        "matched_points": 0,
+        "matched_raw_records": 0,
+        "unmatched_points": 0,
+        "unmatched_raw_records": 0,
+        "low_confidence_segments": 0,
+        "temporal_removed_steps": 0,
+        "temporal_removed_points": 0,
+        "temporal_removed_segments": 0,
+        "continuity_fill_segments": 0,
+        "graph_connect_segments": 0,
+        "graph_connect_attempts": 0,
+        "graph_connect_failed": 0,
+        "graph_connect_skipped_far": 0,
+        "graph_connect_skipped_untrusted": 0,
+    }
+
+
+def normalize_date_match_stats(date_stats):
+    normalized = {}
+    for date, stats in sorted(date_stats.items()):
+        item = dict(stats)
+        total = item["total_points"]
+        matched = item["matched_points"]
+        item["match_rate"] = round(matched / total, 4) if total else 0
+        normalized[date] = item
+    return normalized
+
+
 def match_points_to_roads(points, file_name, road_grid, ref_lat):
     matched_by_segment = {}
     low_runs = []
     current_low = None
+    date_stats = {}
     matched_points = 0
     matched_records = 0
     unmatched_points = 0
@@ -577,13 +648,18 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
     for index, point in enumerate(points, start=1):
         if index == 1 or index % progress_step == 0:
             print(f"Matching {file_name}: {index:,}/{len(points):,}", flush=True)
+        point_date = point.get("date") or date_from_time(point["start_time"])
+        daily = date_stats.setdefault(point_date, empty_date_match_stats())
+        daily["total_points"] += 1
+        daily["total_raw_records"] += point["count"]
         segment, dist = nearest_road_segment((point["lat"], point["lon"]), road_grid, ref_lat, ROAD_MATCH_MAX_METERS)
         if segment:
-            point_date = point.get("date") or date_from_time(point["start_time"])
             finish_low_confidence_run(low_runs, current_low)
             current_low = None
             matched_points += 1
             matched_records += point["count"]
+            daily["matched_points"] += 1
+            daily["matched_raw_records"] += point["count"]
             max_distance = max(max_distance, dist)
             if route_steps and segment["id"] == last_segment_id and point_date == last_step_date:
                 route_steps[-1]["end_time"] = point["end_time"]
@@ -619,10 +695,14 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
 
         unmatched_points += 1
         unmatched_records += point["count"]
+        daily["unmatched_points"] += 1
+        daily["unmatched_raw_records"] += point["count"]
         last_segment_id = None
         last_step_date = None
-        if current_low is None:
+        if current_low is None or current_low.get("date") != point_date:
+            finish_low_confidence_run(low_runs, current_low)
             current_low = {
+                "date": point_date,
                 "start_time": point["start_time"],
                 "end_time": point["end_time"],
                 "points": 0,
@@ -635,6 +715,9 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
         current_low["raw_records"] += point["count"]
         add_osrm_sample(current_low, point)
     finish_low_confidence_run(low_runs, current_low)
+    for run in low_runs:
+        run_date = run.get("date") or date_from_time(run["start_time"])
+        date_stats.setdefault(run_date, empty_date_match_stats())["low_confidence_segments"] += 1
 
     match_rate = matched_points / len(points) if points else 0
     print(f"Matched {file_name}: {matched_points:,}/{len(points):,} ({match_rate:.1%})", flush=True)
@@ -653,6 +736,7 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             "route_steps": len(route_steps),
             "low_confidence_segments": len(low_runs),
             "max_local_distance_m": round(max_distance, 1),
+            "by_date": normalize_date_match_stats(date_stats),
         },
     }
 
@@ -687,6 +771,7 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
 
         removed_steps = 0
         removed_points = 0
+        removed_segments_by_date = {}
         for start, end, total_points in runs:
             steps = end - start + 1
             if steps < TEMPORAL_MIN_ISLAND_STEPS and total_points < TEMPORAL_MIN_ISLAND_POINTS:
@@ -695,6 +780,11 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
                         keep[index] = False
                         removed_steps += 1
                         removed_points += route_steps[index]["points"]
+                        step_date = route_steps[index].get("date", "")
+                        daily = match["summary"]["by_date"].setdefault(step_date, empty_date_match_stats())
+                        daily["temporal_removed_steps"] += 1
+                        daily["temporal_removed_points"] += route_steps[index]["points"]
+                        removed_segments_by_date.setdefault(step_date, set()).add(route_steps[index]["segment_id"])
 
         # Remove one-off spikes that jump away and then return to a nearby route.
         for index in range(1, len(route_steps) - 1):
@@ -723,6 +813,11 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
                 keep[index] = False
                 removed_steps += 1
                 removed_points += route_steps[index]["points"]
+                step_date = route_steps[index].get("date", "")
+                daily = match["summary"]["by_date"].setdefault(step_date, empty_date_match_stats())
+                daily["temporal_removed_steps"] += 1
+                daily["temporal_removed_points"] += route_steps[index]["points"]
+                removed_segments_by_date.setdefault(step_date, set()).add(route_steps[index]["segment_id"])
 
         cleaned_steps = [step for index, step in enumerate(route_steps) if keep[index]]
         kept_segment_ids = {step["segment_id"] for step in cleaned_steps}
@@ -744,6 +839,9 @@ def clean_temporal_route_steps(matches_by_file, segments_by_id):
         match["summary"]["temporal_removed_steps"] = removed_steps
         match["summary"]["temporal_removed_points"] = removed_points
         match["summary"]["temporal_removed_segments"] = removed_segments
+        for date, segment_ids in removed_segments_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["temporal_removed_segments"] = len(segment_ids)
+        match["summary"]["by_date"] = normalize_date_match_stats(match["summary"]["by_date"])
         match["summary"]["route_steps"] = len(cleaned_steps)
         match["summary"]["matched_segments"] = len(match["matched_by_segment"])
         clean_summary[file_name] = {
@@ -764,6 +862,7 @@ def fill_same_way_continuity(matches_by_file, way_segments):
     for file_name, match in matches_by_file.items():
         matched_by_segment = match["matched_by_segment"]
         filled = 0
+        filled_by_date = {}
         route_steps = match.get("route_steps", [])
         for left_step, right_step in zip(route_steps, route_steps[1:]):
             if left_step.get("date") != right_step.get("date"):
@@ -809,7 +908,11 @@ def fill_same_way_continuity(matches_by_file, way_segments):
                     stats.setdefault("dates", set()).add(fill_date)
                 if is_new:
                     filled += 1
+                    filled_by_date.setdefault(fill_date, set()).add(segment["id"])
         match["summary"]["continuity_fill_segments"] = filled
+        for date, segment_ids in filled_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["continuity_fill_segments"] += len(segment_ids)
+        match["summary"]["by_date"] = normalize_date_match_stats(match["summary"]["by_date"])
         match["summary"]["drawn_segments"] = len(matched_by_segment)
         fill_summary[file_name] = filled
         print(f"Continuity fill {file_name}: {filled:,} road segments", flush=True)
@@ -825,10 +928,18 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
         added = 0
         attempted = 0
         skipped_far = 0
+        skipped_untrusted = 0
         failed = 0
+        added_by_date = {}
+        attempts_by_date = {}
+        failed_by_date = {}
+        skipped_far_by_date = {}
+        skipped_untrusted_by_date = {}
+        untrusted_reasons = {}
         for left_step, right_step in zip(route_steps, route_steps[1:]):
             if left_step.get("date") != right_step.get("date"):
                 continue
+            step_date = left_step.get("date", "")
             left_id = left_step["segment_id"]
             right_id = right_step["segment_id"]
             if left_id == right_id:
@@ -842,14 +953,26 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
             aerial = segment_endpoint_distance_m(left, right)
             if aerial > ROAD_CONNECT_MAX_AERIAL_METERS:
                 skipped_far += 1
+                skipped_far_by_date[step_date] = skipped_far_by_date.get(step_date, 0) + 1
                 continue
             attempted += 1
+            attempts_by_date[step_date] = attempts_by_date.get(step_date, 0) + 1
             key = (left_id, right_id)
             if key not in path_cache:
                 path_cache[key] = shortest_path_between_segments(left, right, road_graph)
             path_ids = path_cache[key]
-            if not path_ids:
+            if path_ids is None:
                 failed += 1
+                failed_by_date[step_date] = failed_by_date.get(step_date, 0) + 1
+                continue
+            if not path_ids:
+                continue
+            path_length = route_path_length_m(path_ids, segments_by_id)
+            trusted, reason = trusted_graph_connection(left_step, right_step, aerial, path_length)
+            if not trusted:
+                skipped_untrusted += 1
+                skipped_untrusted_by_date[step_date] = skipped_untrusted_by_date.get(step_date, 0) + 1
+                untrusted_reasons[reason] = untrusted_reasons.get(reason, 0) + 1
                 continue
             for segment_id in path_ids:
                 if segment_id in {left_id, right_id}:
@@ -869,6 +992,7 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
                 })
                 if is_new:
                     added += 1
+                    added_by_date.setdefault(step_date, set()).add(segment_id)
                 if left_step.get("date"):
                     stats.setdefault("dates", set()).add(left_step["date"])
                 stats["graph_connect"] = True
@@ -876,16 +1000,32 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
         match["summary"]["graph_connect_attempts"] = attempted
         match["summary"]["graph_connect_failed"] = failed
         match["summary"]["graph_connect_skipped_far"] = skipped_far
+        match["summary"]["graph_connect_skipped_untrusted"] = skipped_untrusted
+        match["summary"]["graph_connect_untrusted_reasons"] = dict(sorted(untrusted_reasons.items()))
+        for date, count in attempts_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["graph_connect_attempts"] += count
+        for date, count in failed_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["graph_connect_failed"] += count
+        for date, count in skipped_far_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["graph_connect_skipped_far"] += count
+        for date, count in skipped_untrusted_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["graph_connect_skipped_untrusted"] += count
+        for date, segment_ids in added_by_date.items():
+            match["summary"]["by_date"].setdefault(date, empty_date_match_stats())["graph_connect_segments"] += len(segment_ids)
+        match["summary"]["by_date"] = normalize_date_match_stats(match["summary"]["by_date"])
         match["summary"]["drawn_segments"] = len(matched_by_segment)
         connect_summary[file_name] = {
             "added_segments": added,
             "attempts": attempted,
             "failed": failed,
             "skipped_far": skipped_far,
+            "skipped_untrusted": skipped_untrusted,
+            "untrusted_reasons": dict(sorted(untrusted_reasons.items())),
         }
         print(
             f"Graph connect {file_name}: {added:,} road segments, "
-            f"{attempted:,} attempts, {failed:,} failed, {skipped_far:,} skipped far",
+            f"{attempted:,} attempts, {failed:,} failed, "
+            f"{skipped_far:,} skipped far, {skipped_untrusted:,} skipped untrusted",
             flush=True,
         )
     return connect_summary
@@ -1459,28 +1599,41 @@ def build_html(data_json_name):
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
 
-        const drawSegment = (segment, strokeStyle, lineWidth, alpha) => {{
+        const drawSegment = (segment, strokeStyle, lineWidth, alpha, offset = 0) => {{
           const pts = segment.path.map(([lat, lon]) => this.map.latLngToContainerPoint([lat, lon]));
           segment.projected = pts;
           if (pts.length < 2) return;
+          const first = pts[0];
+          const last = pts[pts.length - 1];
+          const dx = last.x - first.x;
+          const dy = last.y - first.y;
+          const len = Math.hypot(dx, dy) || 1;
+          const ox = -dy / len * offset;
+          const oy = dx / len * offset;
           ctx.beginPath();
           ctx.strokeStyle = strokeStyle;
           ctx.lineWidth = lineWidth;
           ctx.globalAlpha = alpha;
-          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+          pts.forEach((pt, index) => index === 0 ? ctx.moveTo(pt.x + ox, pt.y + oy) : ctx.lineTo(pt.x + ox, pt.y + oy));
           ctx.stroke();
         }};
 
         const activeSegments = this.segments
           .map(segment => [segment, this.segmentActiveFiles(segment)])
           .filter(([, files]) => files.length);
-        for (const [segment] of activeSegments) {{
-          drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 8 : 6.4, 0.82);
+        for (const [segment, files] of activeSegments) {{
+          files.forEach((file, index) => {{
+            const offset = (index - (files.length - 1) / 2) * 5;
+            drawSegment(segment, "rgba(255, 255, 255, 0.95)", segment.source === "osrm" ? 7.8 : 5.8, 0.82, offset);
+          }});
         }}
         for (const [segment, files] of activeSegments) {{
-          const color = files.includes("01.csv") ? this.routeColor.get("01.csv") : this.routeColor.get(files[0]);
-          const width = segment.source === "osrm" ? 4.8 : (files.includes("01.csv") ? 4.4 : 3.4);
-          drawSegment(segment, color || "#2563eb", width, segment.source === "osrm" ? 0.96 : 0.86);
+          files.forEach((file, index) => {{
+            const offset = (index - (files.length - 1) / 2) * 5;
+            const color = this.routeColor.get(file) || "#2563eb";
+            const width = segment.source === "osrm" ? 4.6 : 3.2;
+            drawSegment(segment, color, width, segment.source === "osrm" ? 0.96 : 0.86, offset);
+          }});
         }}
         ctx.globalAlpha = 1;
       }},
@@ -1499,7 +1652,14 @@ def build_html(data_json_name):
         const segment = best.segment;
         const counts = Object.entries(segment.match_counts_by_file || {{}})
           .filter(([file]) => best.files.includes(file))
-          .map(([file, count]) => `<code>${{escapeHtml(file)}}</code>：${{Number(count || 0).toLocaleString()}} 条`)
+          .map(([file, count]) => {{
+            const dateCount = datesForFileInRange(segment.dates_by_file, file).length;
+            const flags = [
+              (segment.graph_connect_files || []).includes(file) ? "可信路网连接" : "",
+              (segment.continuity_fill_files || []).includes(file) ? "同路补齐" : ""
+            ].filter(Boolean).join("，");
+            return `<code>${{escapeHtml(file)}}</code>：${{Number(count || 0).toLocaleString()}} 条，${{dateCount}} 天${{flags ? `，${{flags}}` : ""}}`;
+          }})
           .join("<br>");
         L.popup()
           .setLatLng(event.latlng)
@@ -1558,6 +1718,34 @@ def build_html(data_json_name):
     function datesByFileInRange(datesByFile, files) {{
       if (!activeStartDate && !activeEndDate) return true;
       return (files || []).some(file => datesInRange((datesByFile || {{}})[file] || []));
+    }}
+
+    function datesForFileInRange(datesByFile, file, startDate = activeStartDate, endDate = activeEndDate) {{
+      return ((datesByFile || {{}})[file] || []).filter(date => dateInRange(date, startDate, endDate));
+    }}
+
+    function aggregateDateStats(route, startDate = activeStartDate, endDate = activeEndDate) {{
+      const byDate = route.road_match.by_date || {{}};
+      const total = {{
+        total_points: 0,
+        matched_points: 0,
+        low_confidence_segments: 0,
+        temporal_removed_segments: 0,
+        continuity_fill_segments: 0,
+        graph_connect_segments: 0,
+        graph_connect_attempts: 0,
+        graph_connect_failed: 0,
+        graph_connect_skipped_far: 0,
+        graph_connect_skipped_untrusted: 0
+      }};
+      Object.entries(byDate).forEach(([date, stats]) => {{
+        if (!dateInRange(date, startDate, endDate)) return;
+        Object.keys(total).forEach(key => {{
+          total[key] += Number(stats[key] || 0);
+        }});
+      }});
+      total.match_rate = total.total_points ? total.matched_points / total.total_points : 0;
+      return total;
     }}
 
     function hasActiveFile(files) {{
@@ -1667,28 +1855,42 @@ def build_html(data_json_name):
         );
         const renderStats = () => {{
           const visibleSegments = (data.road_segments || []).filter(segmentVisible).length;
-          const lowQuality = data.routes.filter(route => activeFiles.has(route.file) && route.road_match.refined_match_rate < 0.9);
+          const activeRoutes = data.routes.filter(route => activeFiles.has(route.file));
+          const rangeStatsByFile = new Map(activeRoutes.map(route => [route.file, aggregateDateStats(route)]));
+          const selectedPoints = Array.from(rangeStatsByFile.values()).reduce((sum, stats) => sum + stats.total_points, 0);
+          const selectedMatched = Array.from(rangeStatsByFile.values()).reduce((sum, stats) => sum + stats.matched_points, 0);
+          const selectedRate = selectedPoints ? selectedMatched / selectedPoints : 0;
+          const lowQuality = activeRoutes.filter(route => {{
+            const stats = rangeStatsByFile.get(route.file);
+            return stats && stats.total_points > 0 && stats.match_rate < 0.9;
+          }});
           const dateText = activeStartDate || activeEndDate
             ? `${{activeStartDate || "最早"}} 至 ${{activeEndDate || "最晚"}}`
             : "全部日期";
-          const matchRows = data.routes.filter(route => activeFiles.has(route.file)).map(route =>
-            `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，按时间剔除 ${{route.road_match.temporal_removed_segments || 0}} 段，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+          const matchRows = activeRoutes.map(route => {{
+            const stats = rangeStatsByFile.get(route.file) || aggregateDateStats(route);
+            if (!stats.total_points) {{
+              return `<div><code>${{escapeHtml(route.file)}}</code> 当前范围无数据；全量匹配 ${{formatPercent(route.road_match.match_rate)}}</div>`;
+            }}
+            return `<div><code>${{escapeHtml(route.file)}}</code> 当前范围匹配 ${{formatPercent(stats.match_rate)}}（${{Number(stats.matched_points || 0).toLocaleString()}}/${{Number(stats.total_points || 0).toLocaleString()}} 点），全量 ${{formatPercent(route.road_match.match_rate)}}；剔除 ${{stats.temporal_removed_segments || 0}} 段，同路补齐 ${{stats.continuity_fill_segments || 0}} 段，可信路网连接 ${{stats.graph_connect_segments || 0}} 段，低置信 ${{stats.low_confidence_segments || 0}} 段，不可信跳过 ${{stats.graph_connect_skipped_untrusted || 0}} 次${{stats.match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`;
+          }}
           ).join("");
           document.getElementById("stats").innerHTML = `
             <div class="stat"><strong>${{activeFiles.size}}</strong>CSV 轨迹</div>
-            <div class="stat"><strong>${{data.summary.total_raw_points.toLocaleString()}}</strong>原始定位点</div>
+            <div class="stat"><strong>${{selectedPoints.toLocaleString()}}</strong>当前压缩点</div>
+            <div class="stat"><strong>${{formatPercent(selectedRate)}}</strong>当前匹配率</div>
             <div class="stat"><strong>${{visibleSegments.toLocaleString()}}</strong>道路化片段</div>
             <div class="stat"><strong>${{data.osm_counts.confirmed_stop_bus_stop || 0}}</strong>正式站 / <strong style="display:inline">${{data.osm_counts.traffic_signal}}</strong>灯</div>
           `;
           document.getElementById("legend").innerHTML = `
             <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
             <div>日期范围：${{escapeHtml(dateText)}}</div>
-            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接同日相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+            <div>主轨迹已道路化：按日期/时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路；只用同日、时间连续、速度和绕行比例可信的 OSM 路网连接补齐缺口。</div>
             <div class="match-list">${{matchRows}}</div>
             <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
             <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
             <div>正式站阈值：同一 CSV 同一 OSM 站点至少 ${{data.summary.confirmed_stop_min_events}} 次、跨至少 ${{data.summary.confirmed_stop_min_days}} 天；靠近红绿灯但缺少重复规律的停车只保留为候选。</div>
-            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${{lowQuality.length ? " 有线路精修后仍低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}}</div>
+            <div>CSV 和日期下拉框会联动隐藏/显示对应道路轨迹、充电位置、站点、红绿灯。${{lowQuality.length ? " 当前日期范围内有线路低于 90%，建议后续接入高德/百度/Google API 深度精修。" : ""}}</div>
           `;
         }};
         data.routes.forEach((route, index) => {{
@@ -1841,6 +2043,8 @@ def main():
         route["road_match"]["graph_connect_attempts"] = summary["graph_connect_attempts"]
         route["road_match"]["graph_connect_failed"] = summary["graph_connect_failed"]
         route["road_match"]["graph_connect_skipped_far"] = summary["graph_connect_skipped_far"]
+        route["road_match"]["graph_connect_skipped_untrusted"] = summary["graph_connect_skipped_untrusted"]
+        route["road_match"]["graph_connect_untrusted_reasons"] = summary["graph_connect_untrusted_reasons"]
         route["road_match"]["drawn_segments"] = summary["drawn_segments"]
     route_grids_by_file = {
         file_name: build_route_vertex_index_from_segments(match["matched_by_segment"], segments_by_id, ref_lat)
