@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>生产路线复核</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .panel {
+      position: absolute;
+      right: 12px;
+      bottom: 20px;
+      z-index: 900;
+      width: min(360px, calc(100vw - 24px));
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid #d4dae5;
+      border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(31, 41, 55, 0.18);
+      padding: 12px 14px;
+      color: #172033;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .panel strong { display: block; font-size: 15px; margin-bottom: 7px; }
+    .row { display: flex; justify-content: space-between; gap: 14px; }
+    .leaflet-popup-content { font-size: 13px; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <aside class="panel" id="panel">
+    <strong>生产路线复核</strong>
+    <div class="row"><span>A/B 可用路线</span><span id="acceptedCount">0</span></div>
+    <div class="row"><span>C/D 复核片段</span><span id="reviewCount">0</span></div>
+    <div id="routeBreakdown"></div>
+  </aside>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map("map", { preferCanvas: true });
+    const base = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+    const routeColors = {
+      "01.csv": "#2563eb",
+      "02.csv": "#16a34a",
+      "03.csv": "#dc2626",
+      "04.csv": "#7c3aed",
+      "05.csv": "#ea580c"
+    };
+
+    function colorFor(file) {
+      return routeColors[file] || "#334155";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+      }[ch]));
+    }
+
+    function bindPopup(feature, layer) {
+      const p = feature.properties || {};
+      layer.bindPopup(`
+        <strong>${escapeHtml(p.file)} · ${escapeHtml(p.job_id)}</strong><br>
+        等级：${escapeHtml(p.grade)}，分数：${escapeHtml(p.score)}<br>
+        状态：${escapeHtml(p.status)}<br>
+        原因：${escapeHtml(p.reasons || "无")}<br>
+        时间：${escapeHtml(p.start_time)} 至 ${escapeHtml(p.end_time)}<br>
+        里程：${escapeHtml(p.corrected_distance_m || p.raw_distance_m || "")} m
+      `);
+    }
+
+    Promise.all([
+      fetch("corrected_routes.geojson").then(r => r.json()),
+      fetch("review_segments.geojson").then(r => r.json())
+    ]).then(([accepted, review]) => {
+      const acceptedLines = accepted.features.filter(f => f.geometry.type === "LineString");
+      const reviewLines = review.features.filter(f => f.geometry.type === "LineString");
+      const files = Array.from(new Set(
+        acceptedLines.concat(reviewLines).map(f => f.properties.file)
+      )).sort();
+      const overlays = {};
+      const visibleLayers = [];
+      const breakdown = [];
+
+      files.forEach(file => {
+        const acceptedForFile = acceptedLines.filter(f => f.properties.file === file);
+        const reviewForFile = reviewLines.filter(f => f.properties.file === file);
+        const color = colorFor(file);
+        if (acceptedForFile.length) {
+          const layer = L.geoJSON({ type: "FeatureCollection", features: acceptedForFile }, {
+            style: feature => ({
+              color,
+              weight: feature.properties.grade === "A" ? 4 : 3,
+              opacity: 0.9
+            }),
+            onEachFeature: bindPopup
+          }).addTo(map);
+          overlays[`${file} A/B 可用`] = layer;
+          visibleLayers.push(layer);
+        }
+        if (reviewForFile.length) {
+          const layer = L.geoJSON({ type: "FeatureCollection", features: reviewForFile }, {
+            style: () => ({
+              color,
+              weight: 2,
+              opacity: 0.52
+            }),
+            onEachFeature: bindPopup
+          }).addTo(map);
+          overlays[`${file} C/D 复核`] = layer;
+          visibleLayers.push(layer);
+        }
+        breakdown.push(`<div class="row"><span><span style="display:inline-block;width:22px;height:4px;border-radius:3px;background:${color};vertical-align:2px;margin-right:7px"></span>${file}</span><span>${acceptedForFile.length}/${reviewForFile.length}</span></div>`);
+      });
+
+      L.control.layers({"OpenStreetMap": base}, overlays, { collapsed: false }).addTo(map);
+      document.getElementById("acceptedCount").textContent = acceptedLines.length.toLocaleString();
+      document.getElementById("reviewCount").textContent = reviewLines.length.toLocaleString();
+      document.getElementById("routeBreakdown").innerHTML = breakdown.join("");
+      const bounds = L.featureGroup(visibleLayers).getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [24, 24] });
+      else map.setView([30.27, 120.18], 12);
+    });
+  </script>
+</body>
+</html>

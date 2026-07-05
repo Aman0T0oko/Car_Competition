@@ -1,0 +1,120 @@
+{
+  "status": "provider_results_required",
+  "policy": {
+    "accepted_grades": [
+      "A",
+      "B"
+    ],
+    "review_grades": [
+      "C",
+      "D"
+    ],
+    "route_only_sampling": {
+      "stop_speed_kmh": 1.0,
+      "min_route_sample_meters": 25,
+      "max_route_sample_seconds": 60,
+      "rdp_epsilon_meters": 18,
+      "charging_states_excluded_from_route": [
+        "1",
+        "4"
+      ]
+    },
+    "min_accepted_coverage": 0.92,
+    "min_engine_agreement": 0.85,
+    "max_distance_delta_ratio": 0.12
+  },
+  "provider_result_schema": {
+    "path": "required list of [lat, lon] points or objects with lat/lon",
+    "distance_m": "optional corrected distance in meters",
+    "coverage": "optional 0..1 provider point/path coverage",
+    "confidence": "optional 0..1 provider confidence"
+  },
+  "routes": [
+    {
+      "file": "01.csv",
+      "input_points": 589555,
+      "route_points": 52207,
+      "route_point_reduction_ratio": 0.9114,
+      "moving_runs": 2082,
+      "correction_jobs": 3174,
+      "job_payload_dir": "outputs/production/correction_jobs/01",
+      "provider_result_dir": "outputs/production/provider_results/<provider>/01",
+      "grades": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 3174
+      }
+    },
+    {
+      "file": "02.csv",
+      "input_points": 913401,
+      "route_points": 62249,
+      "route_point_reduction_ratio": 0.9318,
+      "moving_runs": 1556,
+      "correction_jobs": 4755,
+      "job_payload_dir": "outputs/production/correction_jobs/02",
+      "provider_result_dir": "outputs/production/provider_results/<provider>/02",
+      "grades": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 4755
+      }
+    },
+    {
+      "file": "03.csv",
+      "input_points": 700395,
+      "route_points": 59490,
+      "route_point_reduction_ratio": 0.9151,
+      "moving_runs": 2106,
+      "correction_jobs": 3628,
+      "job_payload_dir": "outputs/production/correction_jobs/03",
+      "provider_result_dir": "outputs/production/provider_results/<provider>/03",
+      "grades": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 3628
+      }
+    },
+    {
+      "file": "04.csv",
+      "input_points": 662778,
+      "route_points": 56958,
+      "route_point_reduction_ratio": 0.9141,
+      "moving_runs": 963,
+      "correction_jobs": 3494,
+      "job_payload_dir": "outputs/production/correction_jobs/04",
+      "provider_result_dir": "outputs/production/provider_results/<provider>/04",
+      "grades": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 3494
+      }
+    },
+    {
+      "file": "05.csv",
+      "input_points": 952204,
+      "route_points": 65527,
+      "route_point_reduction_ratio": 0.9312,
+      "moving_runs": 1587,
+      "correction_jobs": 5043,
+      "job_payload_dir": "outputs/production/correction_jobs/05",
+      "provider_result_dir": "outputs/production/provider_results/<provider>/05",
+      "grades": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 5043
+      }
+    }
+  ],
+  "outputs": {
+    "corrected_routes_geojson": "outputs/corrected_routes.geojson",
+    "review_segments_geojson": "outputs/review_segments.geojson",
+    "route_quality_report_csv": "outputs/route_quality_report.csv",
+    "review_html": "outputs/production_route_review.html"
+  }
+}
