@@ -37,6 +37,7 @@ ROAD_CONNECT_MAX_PATH_METERS = 1200
 ROAD_CONNECT_MAX_SEARCH_NODES = 3500
 WAY_GAP_FILL_MAX_SEGMENTS = 80
 WAY_GAP_FILL_MAX_METERS = 2500
+RESIDENTIAL_MATCH_MAX_METERS = 18
 LOW_CONFIDENCE_MIN_POINTS = 3
 OSRM_MAX_POINTS = 100
 OSRM_MAX_SEGMENTS_PER_ROUTE = 12
@@ -48,6 +49,37 @@ STOP_TO_BUS_STOP_METERS = 55
 CONFIRMED_STOP_MIN_EVENTS = 3
 CONFIRMED_STOP_MIN_DAYS = 2
 TRAFFIC_SIGNAL_FILTER_METERS = 35
+
+DISALLOWED_BUS_HIGHWAYS = {"service", "living_street", "pedestrian", "footway", "path", "cycleway"}
+DISALLOWED_ACCESS = {"private", "no"}
+ROAD_MATCH_PENALTY = {
+    "motorway": 6,
+    "trunk": 4,
+    "primary": 0,
+    "secondary": 0,
+    "tertiary": 3,
+    "unclassified": 8,
+    "residential": 28,
+    "motorway_link": 8,
+    "trunk_link": 8,
+    "primary_link": 6,
+    "secondary_link": 6,
+    "tertiary_link": 8,
+}
+ROAD_GRAPH_COST_MULTIPLIER = {
+    "motorway": 1.15,
+    "trunk": 1.05,
+    "primary": 1.0,
+    "secondary": 1.0,
+    "tertiary": 1.15,
+    "unclassified": 1.35,
+    "residential": 3.0,
+    "motorway_link": 1.2,
+    "trunk_link": 1.15,
+    "primary_link": 1.1,
+    "secondary_link": 1.1,
+    "tertiary_link": 1.2,
+}
 
 
 def parse_float(value, default=None):
@@ -89,6 +121,27 @@ def project(lon, lat, ref_lat):
 
 def road_node_key(lat, lon):
     return f"{lat:.7f},{lon:.7f}"
+
+
+def bus_road_allowed(tags):
+    highway = tags.get("highway", "")
+    access = tags.get("access", "")
+    if highway in DISALLOWED_BUS_HIGHWAYS or access in DISALLOWED_ACCESS:
+        return False
+    if highway == "residential" and not tags.get("name"):
+        return False
+    return highway in ROAD_MATCH_PENALTY
+
+
+def road_match_score(segment, dist):
+    highway = segment.get("highway", "")
+    if highway == "residential" and dist > RESIDENTIAL_MATCH_MAX_METERS:
+        return None
+    return dist + ROAD_MATCH_PENALTY.get(highway, 50)
+
+
+def road_graph_cost(segment):
+    return segment["length_m"] * ROAD_GRAPH_COST_MULTIPLIER.get(segment.get("highway", ""), 2.0)
 
 
 def point_segment_distance_xy(px, py, segment):
@@ -307,6 +360,8 @@ def load_osm_roads(path, ref_lat):
             continue
         tags = element.get("tags", {})
         highway = tags.get("highway", "")
+        if not bus_road_allowed(tags):
+            continue
         name = tags.get("name") or tags.get("ref") or ""
         way_id = element.get("id")
         for index in range(len(geometry) - 1):
@@ -328,6 +383,8 @@ def load_osm_roads(path, ref_lat):
                 "index": index,
                 "name": name,
                 "highway": highway,
+                "access": tags.get("access", ""),
+                "service": tags.get("service", ""),
                 "path": [[round(lat1, 7), round(lon1, 7)], [round(lat2, 7), round(lon2, 7)]],
                 "start_node": start_node,
                 "end_node": end_node,
@@ -367,11 +424,14 @@ def build_way_segment_index(segments):
 def build_road_graph(segments):
     graph = {}
     for segment in segments:
+        if segment.get("highway") == "residential":
+            continue
         a = segment["start_node"]
         b = segment["end_node"]
         length = segment["length_m"]
-        graph.setdefault(a, []).append((b, length, segment["id"]))
-        graph.setdefault(b, []).append((a, length, segment["id"]))
+        cost = road_graph_cost(segment)
+        graph.setdefault(a, []).append((b, length, cost, segment["id"]))
+        graph.setdefault(b, []).append((a, length, cost, segment["id"]))
     return graph
 
 
@@ -380,7 +440,7 @@ def nearest_road_segment(point, road_grid, ref_lat, max_m):
     ix = int(px // ROAD_GRID_METERS)
     iy = int(py // ROAD_GRID_METERS)
     cells = int(math.ceil(max_m / ROAD_GRID_METERS)) + 1
-    best = (float("inf"), None)
+    best = (float("inf"), float("inf"), None)
     seen = set()
     for dx in range(-cells, cells + 1):
         for dy in range(-cells, cells + 1):
@@ -389,11 +449,14 @@ def nearest_road_segment(point, road_grid, ref_lat, max_m):
                     continue
                 seen.add(segment["id"])
                 dist = point_segment_distance_xy(px, py, segment)
-                if dist < best[0]:
-                    best = (dist, segment)
-    if best[1] is None or best[0] > max_m:
+                score = road_match_score(segment, dist)
+                if score is None:
+                    continue
+                if score < best[0] or (score == best[0] and dist < best[1]):
+                    best = (score, dist, segment)
+    if best[2] is None or best[1] > max_m:
         return None, None
-    return best[1], best[0]
+    return best[2], best[1]
 
 
 def segment_endpoint_distance_m(left, right):
@@ -412,31 +475,35 @@ def shortest_path_between_segments(start_segment, end_segment, graph):
     start_nodes = [start_segment["start_node"], start_segment["end_node"]]
     end_nodes = {end_segment["start_node"], end_segment["end_node"]}
     queue = []
-    best = {}
+    best_cost = {}
+    best_length = {}
     previous = {}
     for node in start_nodes:
-        best[node] = 0
-        heapq.heappush(queue, (0, node))
+        best_cost[node] = 0
+        best_length[node] = 0
+        heapq.heappush(queue, (0, 0, node))
     visited = 0
     found = None
     while queue and visited < ROAD_CONNECT_MAX_SEARCH_NODES:
-        dist, node = heapq.heappop(queue)
-        if dist != best.get(node):
+        cost, path_length, node = heapq.heappop(queue)
+        if cost != best_cost.get(node):
             continue
         visited += 1
-        if dist > ROAD_CONNECT_MAX_PATH_METERS:
+        if path_length > ROAD_CONNECT_MAX_PATH_METERS:
             break
         if node in end_nodes:
             found = node
             break
-        for next_node, edge_length, segment_id in graph.get(node, []):
-            next_dist = dist + edge_length
-            if next_dist > ROAD_CONNECT_MAX_PATH_METERS:
+        for next_node, edge_length, edge_cost, segment_id in graph.get(node, []):
+            next_length = path_length + edge_length
+            next_cost = cost + edge_cost
+            if next_length > ROAD_CONNECT_MAX_PATH_METERS:
                 continue
-            if next_dist < best.get(next_node, float("inf")):
-                best[next_node] = next_dist
+            if next_cost < best_cost.get(next_node, float("inf")):
+                best_cost[next_node] = next_cost
+                best_length[next_node] = next_length
                 previous[next_node] = (node, segment_id)
-                heapq.heappush(queue, (next_dist, next_node))
+                heapq.heappush(queue, (next_cost, next_length, next_node))
     if found is None:
         return None
     segment_ids = []
@@ -566,6 +633,8 @@ def fill_same_way_continuity(matches_by_file, way_segments):
         for way_id, matched_indexes in by_way.items():
             segments = way_segments.get(way_id, [])
             if not segments:
+                continue
+            if segments[0].get("highway") == "residential":
                 continue
             segment_by_index = {segment["index"]: segment for segment in segments}
             for left, right in zip(sorted(set(matched_indexes)), sorted(set(matched_indexes))[1:]):
@@ -1384,7 +1453,7 @@ def build_html(data_json_name):
 
         const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
         const matchRows = data.routes.map(route =>
-          `<div><code>${{escapeHtml(route.file)}}</code> 精确匹配 ${{formatPercent(route.road_match.match_rate)}}，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+          `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
         ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
@@ -1394,7 +1463,7 @@ def build_html(data_json_name):
         `;
         document.getElementById("legend").innerHTML = `
           <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
-          <div>主轨迹已道路化：35m 精确吸附为主，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+          <div>主轨迹已道路化：35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
           <div class="match-list">${{matchRows}}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
           <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
