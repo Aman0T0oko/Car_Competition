@@ -38,6 +38,10 @@ ROAD_CONNECT_MAX_SEARCH_NODES = 3500
 WAY_GAP_FILL_MAX_SEGMENTS = 80
 WAY_GAP_FILL_MAX_METERS = 2500
 RESIDENTIAL_MATCH_MAX_METERS = 18
+TEMPORAL_CONTINUITY_MAX_AERIAL_METERS = 450
+TEMPORAL_MIN_ISLAND_POINTS = 60
+TEMPORAL_MIN_ISLAND_STEPS = 8
+TEMPORAL_SPIKE_MAX_POINTS = 8
 LOW_CONFIDENCE_MIN_POINTS = 3
 OSRM_MAX_POINTS = 100
 OSRM_MAX_SEGMENTS_PER_ROUTE = 12
@@ -562,10 +566,17 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             matched_points += 1
             matched_records += point["count"]
             max_distance = max(max_distance, dist)
-            if segment["id"] != last_segment_id:
+            if route_steps and segment["id"] == last_segment_id:
+                route_steps[-1]["end_time"] = point["end_time"]
+                route_steps[-1]["points"] += 1
+                route_steps[-1]["raw_records"] += point["count"]
+            else:
                 route_steps.append({
                     "segment_id": segment["id"],
-                    "time": point["start_time"],
+                    "start_time": point["start_time"],
+                    "end_time": point["end_time"],
+                    "points": 1,
+                    "raw_records": point["count"],
                 })
                 last_segment_id = segment["id"]
             stats = matched_by_segment.setdefault(segment["id"], {
@@ -618,6 +629,92 @@ def match_points_to_roads(points, file_name, road_grid, ref_lat):
             "max_local_distance_m": round(max_distance, 1),
         },
     }
+
+
+def clean_temporal_route_steps(matches_by_file, segments_by_id):
+    clean_summary = {}
+    for file_name, match in matches_by_file.items():
+        route_steps = match.get("route_steps", [])
+        keep = [True] * len(route_steps)
+
+        # Remove small temporal islands that are detached from the surrounding route.
+        runs = []
+        if route_steps:
+            start = 0
+            total_points = route_steps[0]["points"]
+            for index in range(1, len(route_steps)):
+                left = segments_by_id.get(route_steps[index - 1]["segment_id"])
+                right = segments_by_id.get(route_steps[index]["segment_id"])
+                connected = (
+                    left
+                    and right
+                    and segment_endpoint_distance_m(left, right) <= TEMPORAL_CONTINUITY_MAX_AERIAL_METERS
+                )
+                if not connected:
+                    runs.append((start, index - 1, total_points))
+                    start = index
+                    total_points = 0
+                total_points += route_steps[index]["points"]
+            runs.append((start, len(route_steps) - 1, total_points))
+
+        removed_steps = 0
+        removed_points = 0
+        for start, end, total_points in runs:
+            steps = end - start + 1
+            if steps < TEMPORAL_MIN_ISLAND_STEPS and total_points < TEMPORAL_MIN_ISLAND_POINTS:
+                for index in range(start, end + 1):
+                    if keep[index]:
+                        keep[index] = False
+                        removed_steps += 1
+                        removed_points += route_steps[index]["points"]
+
+        # Remove one-off spikes that jump away and then return to a nearby route.
+        for index in range(1, len(route_steps) - 1):
+            if not keep[index] or route_steps[index]["points"] > TEMPORAL_SPIKE_MAX_POINTS:
+                continue
+            prev_segment = segments_by_id.get(route_steps[index - 1]["segment_id"])
+            current_segment = segments_by_id.get(route_steps[index]["segment_id"])
+            next_segment = segments_by_id.get(route_steps[index + 1]["segment_id"])
+            if not prev_segment or not current_segment or not next_segment:
+                continue
+            prev_next = segment_endpoint_distance_m(prev_segment, next_segment)
+            prev_current = segment_endpoint_distance_m(prev_segment, current_segment)
+            current_next = segment_endpoint_distance_m(current_segment, next_segment)
+            if (
+                prev_next <= TEMPORAL_CONTINUITY_MAX_AERIAL_METERS
+                and prev_current > TEMPORAL_CONTINUITY_MAX_AERIAL_METERS
+                and current_next > TEMPORAL_CONTINUITY_MAX_AERIAL_METERS
+            ):
+                keep[index] = False
+                removed_steps += 1
+                removed_points += route_steps[index]["points"]
+
+        cleaned_steps = [step for index, step in enumerate(route_steps) if keep[index]]
+        kept_segment_ids = {step["segment_id"] for step in cleaned_steps}
+        before_segments = len(match["matched_by_segment"])
+        match["matched_by_segment"] = {
+            segment_id: stats
+            for segment_id, stats in match["matched_by_segment"].items()
+            if segment_id in kept_segment_ids
+        }
+        match["route_steps"] = cleaned_steps
+        removed_segments = before_segments - len(match["matched_by_segment"])
+        match["summary"]["temporal_removed_steps"] = removed_steps
+        match["summary"]["temporal_removed_points"] = removed_points
+        match["summary"]["temporal_removed_segments"] = removed_segments
+        match["summary"]["route_steps"] = len(cleaned_steps)
+        match["summary"]["matched_segments"] = len(match["matched_by_segment"])
+        clean_summary[file_name] = {
+            "removed_steps": removed_steps,
+            "removed_points": removed_points,
+            "removed_segments": removed_segments,
+        }
+        print(
+            f"Temporal clean {file_name}: removed {removed_steps:,} steps, "
+            f"{removed_points:,} points, {removed_segments:,} segments",
+            flush=True,
+        )
+    return clean_summary
 
 
 def fill_same_way_continuity(matches_by_file, way_segments):
@@ -714,8 +811,8 @@ def connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph):
                 stats = matched_by_segment.setdefault(segment_id, {
                     "count": 0,
                     "raw_records": 0,
-                    "first_time": left_step["time"],
-                    "last_time": right_step["time"],
+                    "first_time": left_step["start_time"],
+                    "last_time": right_step["end_time"],
                     "max_distance_m": 0,
                     "graph_connect": True,
                 })
@@ -1453,7 +1550,7 @@ def build_html(data_json_name):
 
         const lowQuality = data.routes.filter(route => route.road_match.refined_match_rate < 0.9);
         const matchRows = data.routes.map(route =>
-          `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
+          `<div><code>${{escapeHtml(route.file)}}</code> 公交道路匹配 ${{formatPercent(route.road_match.match_rate)}}，按时间剔除 ${{route.road_match.temporal_removed_segments || 0}} 段，同路补齐 ${{route.road_match.continuity_fill_segments || 0}} 段，路网连接 ${{route.road_match.graph_connect_segments || 0}} 段，低置信 ${{route.road_match.low_confidence_segments}} 段${{route.road_match.refined_match_rate < 0.9 ? "，需要人工/API 精修" : ""}}</div>`
         ).join("");
         document.getElementById("stats").innerHTML = `
           <div class="stat"><strong>${{data.routes.length}}</strong>CSV 轨迹</div>
@@ -1463,7 +1560,7 @@ def build_html(data_json_name):
         `;
         document.getElementById("legend").innerHTML = `
           <div>${{data.routes.map((route, index) => `<span class="route-chip"><span class="line" style="background:${{colors[index % colors.length]}}"></span>${{escapeHtml(route.file)}}</span>`).join("")}}</div>
-          <div>主轨迹已道路化：35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
+          <div>主轨迹已道路化：按时间清洗孤立错误段，35m 公交道路吸附为主，排除小区/服务/私有道路，并用 OSM 路网连接相邻道路段；原始 GPS 折线不在主视图绘制。</div>
           <div class="match-list">${{matchRows}}</div>
           <div><span class="dot" style="background:#0f766e"></span>起点 <span class="dot" style="background:#991b1b;margin-left:12px"></span>终点 <span class="dot" style="background:#f59e0b;margin-left:12px"></span>充电位置</div>
           <div><span class="dot" style="background:#60a5fa"></span>正式站 <span class="dot" style="background:#fde047;margin-left:12px"></span>候选站 <span class="dot" style="background:#dc2626;margin-left:12px"></span>红绿灯</div>
@@ -1556,10 +1653,14 @@ def main():
             "osrm_refinement": osrm_summary,
         })
 
+    temporal_clean_by_file = clean_temporal_route_steps(matches_by_file, segments_by_id)
     continuity_fill_by_file = fill_same_way_continuity(matches_by_file, way_segments)
     graph_connect_by_file = connect_route_steps_by_graph(matches_by_file, segments_by_id, road_graph)
     for route in routes:
         summary = matches_by_file[route["file"]]["summary"]
+        route["road_match"]["temporal_removed_steps"] = summary["temporal_removed_steps"]
+        route["road_match"]["temporal_removed_points"] = summary["temporal_removed_points"]
+        route["road_match"]["temporal_removed_segments"] = summary["temporal_removed_segments"]
         route["road_match"]["continuity_fill_segments"] = summary["continuity_fill_segments"]
         route["road_match"]["graph_connect_segments"] = summary["graph_connect_segments"]
         route["road_match"]["graph_connect_attempts"] = summary["graph_connect_attempts"]
@@ -1608,6 +1709,7 @@ def main():
             "traffic_signal_filter_meters": TRAFFIC_SIGNAL_FILTER_METERS,
             "stop_events": len(stop_events),
             "stop_evidence": stop_evidence,
+            "temporal_clean_by_file": temporal_clean_by_file,
             "continuity_fill_by_file": continuity_fill_by_file,
             "graph_connect_by_file": graph_connect_by_file,
             "way_gap_fill_max_segments": WAY_GAP_FILL_MAX_SEGMENTS,
